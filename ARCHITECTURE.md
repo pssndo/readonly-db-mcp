@@ -1,0 +1,932 @@
+# readonly-db-mcp Architecture
+
+This document describes the architecture, design decisions, and implementation details of readonly-db-mcp — a production-grade MCP server that provides safe, read-only SQL access to PostgreSQL and ClickHouse databases for AI agents.
+
+**For user-facing documentation**, see [README.md](README.md).
+
+---
+
+## Overview
+
+readonly-db-mcp is a pip-installable MCP server that gives AI agents (Claude Code, Cursor, etc.) safe, **read-only** SQL access to PostgreSQL and ClickHouse databases. Three independent layers of write protection ensure that even a compromised or malicious AI agent cannot modify production data.
+
+**Design priorities:**
+- **Security first**: Three-layer defense-in-depth architecture
+- **Zero trust**: Every query is validated, every connection is read-only, every user has minimal privileges
+- **Operational simplicity**: `pip install`, one JSON config block, done
+- **Production ready**: Connection pooling, health checks, structured logging, graceful degradation
+
+---
+
+## Architecture
+
+```
+Claude Code / AI Agent
+        |
+        | MCP protocol (stdio)
+        v
++---------------------------+
+|   readonly-db-mcp server  |
+|                           |
+|  1. sqlglot validation    |  <-- parse SQL AST, reject non-SELECT
+|  2. connection pool       |  <-- asyncpg (PG) / clickhouse-connect (CH)
+|  3. read-only transaction |  <-- belt-and-suspenders enforcement
+|  4. result formatting     |  <-- markdown tables for the AI
++---------------------------+
+        |
+        | SQL (read-only user)
+        v
+  PostgreSQL    ClickHouse
+```
+
+### Three Layers of Write Protection
+
+1. **sqlglot AST validation** -- whitelist approach: root node must be SELECT-family, full tree walk rejects any write node hidden in CTEs/subqueries
+2. **Connection-level settings** -- `default_transaction_read_only=on` (PG), `readonly=1` (CH)
+3. **DB user permissions** -- dedicated users with only `GRANT SELECT` (set up by the operator, not this tool)
+
+---
+
+## Tech Stack
+
+| Component         | Package                     | Version | Why                                                        |
+| ----------------- | --------------------------- | ------- | ---------------------------------------------------------- |
+| MCP framework     | `mcp`                       | >=1.2.0 | Official Python SDK with FastMCP                           |
+| SQL parsing       | `sqlglot`                   | >=26.0  | 31 SQL dialects (PG + CH), zero deps, AST-level inspection |
+| PostgreSQL driver | `asyncpg`                   | >=0.29  | Fast async driver, native read-only transaction support    |
+| ClickHouse driver | `clickhouse-connect`        | >=0.7   | Official ClickHouse Python client                          |
+| Config            | `python-dotenv`             | >=1.0   | Env var / .env parsing (simple, no validation overhead)    |
+| Testing           | `pytest` + `pytest-asyncio` | latest  | Async test support                                         |
+
+Python >=3.11 required.
+
+---
+
+## Project Structure
+
+```
+readonly-db-mcp/
+  ARCHITECTURE.md             # This file — architecture and design docs
+  README.md                   # User-facing install + config docs
+  CLAUDE.md                   # Project instructions for Claude Code
+  pyproject.toml              # Package config, deps, entry point
+  src/
+    readonly_db_mcp/
+      __init__.py             # Package version
+      server.py               # FastMCP server, tool definitions, lifespan, logging
+      config.py               # Env var parsing with python-dotenv
+      validation.py           # sqlglot AST-based read-only query validator
+      formatting.py           # Query results → markdown table conversion
+      databases/
+        __init__.py
+        base.py               # Abstract DatabaseBackend + shared utilities
+        postgres.py           # asyncpg pool, read-only transactions, health checks
+        clickhouse.py         # clickhouse-connect client, readonly=1, reconnection
+  tests/
+    test_validation.py        # SQL validation tests (security-critical)
+    test_config.py            # Config parsing tests
+    test_formatting.py        # Result formatting tests
+    test_backends.py          # Backend unit tests (validation, LIMIT injection)
+    test_server.py            # MCP tool-level integration tests
+```
+
+---
+
+## Configuration
+
+Environment variables (or `.env` file). Multiple databases via numbered prefix.
+
+```env
+# PostgreSQL connections (PG_1_, PG_2_, etc.)
+PG_1_NAME=prod_db
+PG_1_HOST=pg-prod.internal
+PG_1_PORT=5432
+PG_1_DATABASE=myapp
+PG_1_USER=ai_reader
+PG_1_PASSWORD=secret
+
+# ClickHouse connections (CH_1_, CH_2_, etc.)
+CH_1_NAME=analytics
+CH_1_HOST=ch-prod.internal
+CH_1_PORT=8123
+CH_1_DATABASE=events
+CH_1_USER=ai_reader
+CH_1_PASSWORD=secret
+
+# Global settings
+QUERY_TIMEOUT_SECONDS=30       # Per-query timeout
+MAX_RESULT_ROWS=1000           # Truncate results beyond this
+```
+
+---
+
+## Claude Code Setup (end user experience)
+
+```bash
+pip install readonly-db-mcp
+```
+
+Then add to `.claude/mcp.json` in the project:
+
+```json
+{
+  "mcpServers": {
+    "readonly-db": {
+      "command": "readonly-db-mcp",
+      "env": {
+        "PG_1_NAME": "prod_db",
+        "PG_1_HOST": "pg-prod.internal",
+        "PG_1_PORT": "5432",
+        "PG_1_DATABASE": "myapp",
+        "PG_1_USER": "ai_reader",
+        "PG_1_PASSWORD": "secret",
+        "CH_1_NAME": "analytics",
+        "CH_1_HOST": "ch-prod.internal",
+        "CH_1_PORT": "8123",
+        "CH_1_DATABASE": "events",
+        "CH_1_USER": "ai_reader",
+        "CH_1_PASSWORD": "secret"
+      }
+    }
+  }
+}
+```
+
+Claude Code auto-discovers the tools. No further setup.
+
+---
+
+## MCP Tools
+
+Six tools are exposed to the AI:
+
+### 1. `query_postgres`
+
+Execute a read-only SQL query against PostgreSQL.
+
+| Parameter  | Type   | Required | Description                                     |
+| ---------- | ------ | -------- | ----------------------------------------------- |
+| `sql`      | string | yes      | The SQL query                                   |
+| `database` | string | no       | Named PG connection (default: first configured) |
+
+Returns: markdown table of results.
+
+### 2. `query_clickhouse`
+
+Execute a read-only SQL query against ClickHouse.
+
+| Parameter  | Type   | Required | Description                                     |
+| ---------- | ------ | -------- | ----------------------------------------------- |
+| `sql`      | string | yes      | The SQL query                                   |
+| `database` | string | no       | Named CH connection (default: first configured) |
+
+Returns: markdown table of results.
+
+### 3. `list_databases`
+
+List all configured database connections.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| (none)    |      |          |             |
+
+Returns: list of `{name, type, host, database}`.
+
+### 4. `list_tables`
+
+List tables in a database.
+
+| Parameter  | Type   | Required | Description      |
+| ---------- | ------ | -------- | ---------------- |
+| `database` | string | yes      | Named connection |
+
+Returns: list of table names (with schema for PG).
+
+### 5. `describe_table`
+
+Show columns, types, and nullability for a table.
+
+| Parameter  | Type   | Required | Description                        |
+| ---------- | ------ | -------- | ---------------------------------- |
+| `database` | string | yes      | Named connection                   |
+| `table`    | string | yes      | Table name (`schema.table` for PG) |
+
+Returns: markdown table of column definitions.
+
+### 6. `explain_query`
+
+Show the query execution plan.
+
+| Parameter  | Type    | Required | Description                          |
+| ---------- | ------- | -------- | ------------------------------------ |
+| `sql`      | string  | yes      | The SQL query                        |
+| `database` | string  | yes      | Named connection                     |
+| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (default: false) |
+
+Returns: query plan as text.
+
+---
+
+## SQL Validation — Reference Implementation
+
+This is the critical security module. Whitelist approach, not blacklist.
+
+```python
+# src/readonly_db_mcp/validation.py
+from sqlglot import parse, exp
+from sqlglot.errors import ParseError
+
+FORBIDDEN_NODES = (
+    exp.Insert, exp.Update, exp.Delete,
+    exp.Create, exp.Drop, exp.Alter,
+    exp.TruncateTable, exp.Merge, exp.Command,
+    exp.Set, exp.Copy, exp.Transaction,
+    exp.Commit, exp.Rollback,
+    exp.Into,  # SELECT ... INTO creates tables
+)
+
+ALLOWED_ROOT_TYPES = (
+    exp.Select,
+    exp.Union,       # SELECT ... UNION SELECT ...
+    exp.Intersect,   # SELECT ... INTERSECT SELECT ...
+    exp.Except,      # SELECT ... EXCEPT SELECT ...
+)
+
+def validate_read_only(sql: str, dialect: str) -> None:
+    """
+    Validates that a SQL string contains only read-only operations.
+    Raises ValueError with a descriptive message if validation fails.
+    """
+    sql_stripped = sql.strip().rstrip(";")
+    if not sql_stripped:
+        raise ValueError("Empty query")
+
+    try:
+        statements = parse(sql_stripped, dialect=dialect)
+    except ParseError as e:
+        raise ValueError(f"SQL parse error: {e}")
+
+    if not statements:
+        raise ValueError("No valid SQL statements found")
+
+    if len(statements) > 1:
+        raise ValueError("Multiple statements not allowed — send one query at a time")
+
+    ast = statements[0]
+
+    # Whitelist: root must be SELECT-family
+    if not isinstance(ast, ALLOWED_ROOT_TYPES):
+        raise ValueError(
+            f"Only SELECT queries are allowed. Got: {type(ast).__name__}"
+        )
+
+    # Walk full AST to catch writes hidden in CTEs or subqueries
+    for node in ast.walk():
+        if isinstance(node, FORBIDDEN_NODES):
+            raise ValueError(
+                f"Forbidden operation in query: {type(node).__name__}"
+            )
+```
+
+### Validation Test Cases to Cover
+
+**Should PASS:**
+
+- `SELECT * FROM users`
+- `SELECT a, b FROM t1 JOIN t2 ON t1.id = t2.id`
+- `SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)`
+- `WITH cte AS (SELECT * FROM t1) SELECT * FROM cte`
+- `SELECT count(*) FROM events GROUP BY date HAVING count(*) > 10`
+- `SELECT *, ROW_NUMBER() OVER (PARTITION BY x ORDER BY y) FROM t`
+- `SELECT * FROM t1 UNION ALL SELECT * FROM t2`
+- `SELECT * FROM t1 EXCEPT SELECT * FROM t2`
+- ClickHouse: `SELECT count() FROM events` (no args to count)
+- ClickHouse: `SELECT * FROM events ARRAY JOIN tags`
+- PostgreSQL: `SELECT id::text FROM users`
+- PostgreSQL: `SELECT * FROM LATERAL (SELECT ...) sub`
+
+**Should FAIL:**
+
+- `INSERT INTO users VALUES (1, 'x')`
+- `UPDATE users SET name = 'x'`
+- `DELETE FROM users WHERE id = 1`
+- `DROP TABLE users`
+- `ALTER TABLE users ADD COLUMN x INT`
+- `TRUNCATE TABLE users`
+- `CREATE TABLE t (id INT)`
+- `COPY users TO '/tmp/out'`
+- `SET transaction_read_only = off`
+- `SELECT 1; DROP TABLE users` (multi-statement)
+- `WITH del AS (DELETE FROM users RETURNING *) SELECT * FROM del` (CTE with write)
+- Empty string / whitespace only
+- Invalid SQL syntax
+
+---
+
+## Query Execution Flow
+
+```
+AI sends SQL string
+       |
+       v
+[1] validate_read_only(sql, dialect)     — sqlglot parse + AST whitelist check
+       |                                    REJECT with clear message if not pure SELECT
+       v
+[2] acquire connection from pool
+       |
+       v
+[3] execute in read-only context
+       |   PG:  async with conn.transaction(readonly=True): await conn.fetch(sql)
+       |   CH:  client.query(sql, settings={"readonly": "1"})
+       v
+[4] enforce row limit                    — truncate to MAX_RESULT_ROWS
+       |                                    append "(showing N of M rows)" if truncated
+       v
+[5] format_as_markdown_table(columns, rows)
+       |
+       v
+return string to AI agent
+```
+
+Errors at any step return a clear one-line message, never a stack trace.
+
+---
+
+## Server Skeleton — Reference Implementation
+
+```python
+# src/readonly_db_mcp/server.py
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from mcp.server.fastmcp import FastMCP, Context
+
+from .config import load_config
+from .databases.postgres import PostgresBackend
+from .databases.clickhouse import ClickHouseBackend
+from .databases.base import DatabaseBackend
+from .validation import validate_read_only
+from .formatting import format_markdown_table
+
+
+@dataclass
+class AppContext:
+    backends: dict[str, DatabaseBackend] = field(default_factory=dict)
+
+
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    config = load_config()
+    ctx = AppContext()
+
+    # Initialize PG pools
+    for pg in config.postgres_connections:
+        backend = PostgresBackend(pg)
+        await backend.connect()
+        ctx.backends[pg.name] = backend
+
+    # Initialize CH clients
+    for ch in config.clickhouse_connections:
+        backend = ClickHouseBackend(ch)
+        await backend.connect()
+        ctx.backends[ch.name] = backend
+
+    try:
+        yield ctx
+    finally:
+        for backend in ctx.backends.values():
+            await backend.disconnect()
+
+
+mcp = FastMCP("readonly-db-mcp", lifespan=lifespan)
+
+
+def _get_backend(ctx: Context, name: str | None, db_type: str | None = None) -> DatabaseBackend:
+    """Resolve a backend by name or return the first of the given type."""
+    app: AppContext = ctx.request_context.lifespan_context
+    if name:
+        if name not in app.backends:
+            raise ValueError(f"Unknown database: {name}. Available: {list(app.backends.keys())}")
+        return app.backends[name]
+    # Return first backend of the requested type
+    for backend in app.backends.values():
+        if db_type is None or backend.db_type == db_type:
+            return backend
+    raise ValueError(f"No {db_type or 'any'} database configured")
+
+
+@mcp.tool()
+async def query_postgres(sql: str, ctx: Context, database: str | None = None) -> str:
+    """Execute a read-only SQL query against PostgreSQL. Returns results as a markdown table."""
+    validate_read_only(sql, dialect="postgres")
+    backend = _get_backend(ctx, database, db_type="postgres")
+    columns, rows, total = await backend.execute(sql)
+    return format_markdown_table(columns, rows, total)
+
+
+@mcp.tool()
+async def query_clickhouse(sql: str, ctx: Context, database: str | None = None) -> str:
+    """Execute a read-only SQL query against ClickHouse. Returns results as a markdown table."""
+    validate_read_only(sql, dialect="clickhouse")
+    backend = _get_backend(ctx, database, db_type="clickhouse")
+    columns, rows, total = await backend.execute(sql)
+    return format_markdown_table(columns, rows, total)
+
+
+@mcp.tool()
+async def list_databases(ctx: Context) -> str:
+    """List all configured database connections."""
+    app: AppContext = ctx.request_context.lifespan_context
+    lines = []
+    for name, backend in app.backends.items():
+        lines.append(f"- **{name}** ({backend.db_type}) — {backend.host}/{backend.database}")
+    return "\n".join(lines) if lines else "No databases configured."
+
+
+@mcp.tool()
+async def list_tables(database: str, ctx: Context) -> str:
+    """List all tables in a configured database."""
+    backend = _get_backend(ctx, database)
+    tables = await backend.list_tables()
+    return "\n".join(f"- {t}" for t in tables) if tables else "No tables found."
+
+
+@mcp.tool()
+async def describe_table(database: str, table: str, ctx: Context) -> str:
+    """Describe columns, types, and nullability for a table."""
+    backend = _get_backend(ctx, database)
+    columns = await backend.describe_table(table)
+    return format_markdown_table(
+        ["column", "type", "nullable"],
+        [(c["name"], c["type"], c["nullable"]) for c in columns],
+        len(columns),
+    )
+
+
+@mcp.tool()
+async def explain_query(sql: str, database: str, ctx: Context, analyze: bool = False) -> str:
+    """Show the execution plan for a query. Set analyze=True to run EXPLAIN ANALYZE."""
+    validate_read_only(sql, dialect="postgres")  # validate the inner query
+    backend = _get_backend(ctx, database)
+    plan = await backend.explain(sql, analyze=analyze)
+    return plan
+
+
+def main():
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Database Backend Interface
+
+```python
+# src/readonly_db_mcp/databases/base.py
+from abc import ABC, abstractmethod
+
+
+class DatabaseBackend(ABC):
+    db_type: str   # "postgres" or "clickhouse"
+    host: str
+    database: str
+
+    @abstractmethod
+    async def connect(self) -> None: ...
+
+    @abstractmethod
+    async def disconnect(self) -> None: ...
+
+    @abstractmethod
+    async def execute(self, sql: str) -> tuple[list[str], list[tuple], int]:
+        """Returns (column_names, rows, total_row_count_before_truncation)."""
+        ...
+
+    @abstractmethod
+    async def list_tables(self) -> list[str]: ...
+
+    @abstractmethod
+    async def describe_table(self, table: str) -> list[dict]: ...
+
+    @abstractmethod
+    async def explain(self, sql: str, analyze: bool = False) -> str: ...
+```
+
+---
+
+## PostgreSQL Backend Notes
+
+```python
+# Key implementation details for src/readonly_db_mcp/databases/postgres.py
+
+# Connection pool with read-only enforced at connection level:
+pool = await asyncpg.create_pool(
+    dsn=dsn,
+    min_size=1,
+    max_size=5,
+    server_settings={"default_transaction_read_only": "on"},
+)
+
+# Query execution — explicit read-only transaction:
+async with pool.acquire() as conn:
+    async with conn.transaction(readonly=True):
+        rows = await conn.fetch(sql, timeout=query_timeout)
+
+# list_tables query:
+"""
+SELECT schemaname || '.' || tablename AS table_name
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename
+"""
+
+# describe_table query (for schema.table input):
+"""
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = $1 AND table_name = $2
+ORDER BY ordinal_position
+"""
+
+# explain:
+f"EXPLAIN {'ANALYZE ' if analyze else ''}{sql}"
+# EXPLAIN ANALYZE is safe in a read-only transaction — PG rolls back after
+```
+
+---
+
+## ClickHouse Backend Notes
+
+```python
+# Key implementation details for src/readonly_db_mcp/databases/clickhouse.py
+
+# Client init with readonly enforced:
+client = clickhouse_connect.get_client(
+    host=host, port=port,
+    username=user, password=password,
+    database=database,
+    settings={"readonly": "1"},
+)
+
+# Query execution:
+result = client.query(sql, settings={"readonly": "1", "max_execution_time": timeout})
+columns = result.column_names
+rows = result.result_rows
+
+# list_tables query:
+"SHOW TABLES"
+
+# describe_table query:
+f"DESCRIBE TABLE {table}"
+
+# explain:
+f"EXPLAIN {sql}"
+
+# IMPORTANT: clickhouse-connect is synchronous. Wrap in asyncio.to_thread():
+rows = await asyncio.to_thread(client.query, sql, settings={...})
+```
+
+---
+
+## Config Module Notes
+
+```python
+# src/readonly_db_mcp/config.py
+# Use pydantic-settings to parse env vars.
+# Pattern: PG_1_NAME, PG_1_HOST, ... PG_2_NAME, PG_2_HOST, ...
+# Same for CH_1_, CH_2_, etc.
+# Dynamically discover numbered connections from the environment.
+
+import os
+from dataclasses import dataclass
+
+
+@dataclass
+class PostgresConnection:
+    name: str
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+
+
+@dataclass
+class ClickHouseConnection:
+    name: str
+    host: str
+    port: int
+    database: str
+    user: str
+    password: str
+
+
+@dataclass
+class Config:
+    postgres_connections: list[PostgresConnection]
+    clickhouse_connections: list[ClickHouseConnection]
+    query_timeout_seconds: int = 30
+    max_result_rows: int = 1000
+
+
+def load_config() -> Config:
+    """
+    Scan env vars for PG_N_* and CH_N_* patterns using regex.
+    Gaps are allowed: PG_1_ and PG_3_ work even if PG_2_ is missing.
+    """
+    # Scan all env vars for PG_N_NAME patterns to find unique IDs
+    pg_ids = sorted({int(m.group(1)) for k in os.environ if (m := re.match(r"^PG_(\d+)_NAME$", k))})
+    pg_conns = []
+    for i in pg_ids:
+        context = f"PG_{i}"
+        pg_conns.append(PostgresConnection(
+            name=_require_env(f"PG_{i}_NAME", context),
+            host=_require_env(f"PG_{i}_HOST", context),
+            port=int(os.environ.get(f"PG_{i}_PORT", "5432")),
+            database=_require_env(f"PG_{i}_DATABASE", context),
+            user=_require_env(f"PG_{i}_USER", context),
+            password=_require_env(f"PG_{i}_PASSWORD", context),
+        ))
+
+    # Same for CH
+    ch_ids = sorted({int(m.group(1)) for k in os.environ if (m := re.match(r"^CH_(\d+)_NAME$", k))})
+    ch_conns = []
+    for i in ch_ids:
+        context = f"CH_{i}"
+        ch_conns.append(ClickHouseConnection(
+            name=_require_env(f"CH_{i}_NAME", context),
+            host=_require_env(f"CH_{i}_HOST", context),
+            port=int(os.environ.get(f"CH_{i}_PORT", "8123")),
+            database=_require_env(f"CH_{i}_DATABASE", context),
+            user=_require_env(f"CH_{i}_USER", context),
+            password=_require_env(f"CH_{i}_PASSWORD", context),
+        ))
+
+    if not pg_conns and not ch_conns:
+        raise ValueError(
+            "No database connections configured. "
+            "Set PG_1_NAME/PG_1_HOST/... or CH_1_NAME/CH_1_HOST/... environment variables."
+        )
+
+    return Config(
+        postgres_connections=pg_conns,
+        clickhouse_connections=ch_conns,
+        query_timeout_seconds=int(os.environ.get("QUERY_TIMEOUT_SECONDS", "30")),
+        max_result_rows=int(os.environ.get("MAX_RESULT_ROWS", "1000")),
+    )
+```
+
+---
+
+## Formatting Module Notes
+
+```python
+# src/readonly_db_mcp/formatting.py
+
+def format_markdown_table(columns: list[str], rows: list[tuple], total_count: int) -> str:
+    """
+    Format query results as a markdown table.
+    If rows were truncated, append a note.
+    """
+    if not columns:
+        return "Query returned no columns."
+    if not rows:
+        return "Query returned 0 rows."
+
+    # Header
+    header = "| " + " | ".join(str(c) for c in columns) + " |"
+    separator = "| " + " | ".join("---" for _ in columns) + " |"
+
+    # Rows
+    row_lines = []
+    for row in rows:
+        cells = []
+        for val in row:
+            if val is None:
+                cells.append("NULL")
+            else:
+                s = str(val)
+                # Escape pipes in values
+                s = s.replace("|", "\\|")
+                # Truncate very long cell values
+                if len(s) > 200:
+                    s = s[:197] + "..."
+                cells.append(s)
+        row_lines.append("| " + " | ".join(cells) + " |")
+
+    result = "\n".join([header, separator] + row_lines)
+
+    if total_count > len(rows):
+        result += f"\n\n*Showing {len(rows)} of {total_count} rows.*"
+
+    return result
+```
+
+---
+
+## pyproject.toml
+
+```toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "readonly-db-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for PostgreSQL and ClickHouse — safe database access for AI agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "readonly-db-mcp contributors" },
+]
+keywords = ["mcp", "postgresql", "clickhouse", "read-only", "ai", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "mcp>=1.2.0",
+    "sqlglot>=26.0",
+    "asyncpg>=0.29",
+    "clickhouse-connect>=0.7",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+readonly-db-mcp = "readonly_db_mcp.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/readonly_db_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+```
+
+---
+
+## Design Decisions
+
+### Why whitelist validation instead of blacklist?
+
+A blacklist approach would need to enumerate every dangerous SQL keyword and operation. If a new SQL feature is added or a bypass is discovered, the blacklist would miss it. The whitelist approach only allows known-safe operations (`SELECT`, `UNION`, `INTERSECT`, `EXCEPT`) and rejects everything else by default. Unknown operations are automatically blocked.
+
+### Why three layers of write protection?
+
+Each layer alone has known bypasses:
+- **Layer 1 (SQL parsing)** cannot detect side effects inside stored procedures or database functions. `SELECT my_write_function()` looks like a pure SELECT to the AST parser.
+- **Layer 2 (connection-level read-only)** can be overridden by `SET` commands in some configurations (Layer 1 blocks these).
+- **Layer 3 (DB user privileges)** depends on the operator configuring it correctly. If misconfigured, Layers 1 and 2 still protect the database.
+
+Together, they provide defense-in-depth. All three layers must fail for a write to reach production.
+
+### Why python-dotenv instead of pydantic-settings?
+
+Simplicity. This tool has very simple configuration needs (flat env vars with defaults). python-dotenv provides `.env` file loading with zero boilerplate. pydantic-settings adds validation overhead and complexity that isn't needed here — the env var parsing is trivial enough to do manually with clear error messages.
+
+### Why inject LIMIT via AST manipulation instead of subquery wrapping?
+
+Earlier versions wrapped user queries as `SELECT * FROM ({user_sql}) AS _limited_query LIMIT N`. This breaks `ORDER BY` semantics — PostgreSQL does not guarantee that ordering from an inner subquery propagates to the outer query. The AST-based approach modifies the user's query directly to add/tighten the LIMIT clause, preserving all other semantics including ORDER BY.
+
+### Why asyncpg for PostgreSQL but not an async ClickHouse client?
+
+asyncpg is a mature, battle-tested async PostgreSQL driver with connection pooling and health checks built-in. ClickHouse's official Python client (`clickhouse-connect`) is synchronous and uses HTTP under the hood (no persistent connections). We wrap all `clickhouse-connect` calls in `asyncio.to_thread()` to avoid blocking the event loop. This is pragmatic — the overhead is acceptable, and the alternative (using an unofficial async client) introduces more risk.
+
+### Why stdio transport only?
+
+Claude Code (the primary use case) communicates with MCP servers over stdio. HTTP/SSE transport adds complexity (authentication, TLS, deployment) without immediate value. For multi-client scenarios, operators can run multiple server instances with different env configs.
+
+### Why graceful degradation on startup?
+
+In multi-database setups (e.g., prod + staging + analytics), a single database being temporarily unreachable should not block the entire server. The server starts with whatever databases connect successfully and logs failures. This improves operational resilience — the AI can still query available databases while operators fix the failing ones.
+
+### Why no query cost estimation or rate limiting?
+
+Query cost estimation is database-specific and complex to implement correctly. Rate limiting requires per-user tracking and state management. Both add significant complexity. For v0.1, the mitigation strategy is:
+- Conservative timeouts (`QUERY_TIMEOUT_SECONDS`)
+- Row limits (`MAX_RESULT_ROWS`)
+- Database-level resource constraints (`statement_mem`, `max_memory_usage`)
+- Using read replicas instead of primary databases
+
+Operators who need stricter controls can add them at the infrastructure level (reverse proxy, resource quotas, etc.).
+
+---
+
+## Known Limitations (v0.1)
+
+- **No rate limiting or query cost estimation** — see README.md for mitigations
+- **No schema/table filtering** — AI can see all tables the DB user can access
+- **No row-level security** — handled at DB user/role level
+- **No query result caching** — every query hits the database
+- **Stored procedures can bypass validation** — Layer 3 (DB permissions) is mandatory
+- **stdio transport only** — no HTTP/SSE support
+
+---
+
+## DB User Setup (reference for operators)
+
+The MCP server assumes these read-only users exist. This is a one-time infra task, not handled by this tool.
+
+### PostgreSQL
+
+```sql
+CREATE ROLE ai_reader LOGIN PASSWORD 'strong_password_here';
+GRANT CONNECT ON DATABASE mydb TO ai_reader;
+GRANT USAGE ON SCHEMA public TO ai_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ai_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ai_reader;
+-- PG 14+: GRANT pg_read_all_data TO ai_reader;
+```
+
+### ClickHouse
+
+```sql
+CREATE USER ai_reader IDENTIFIED BY 'strong_password_here'
+    SETTINGS PROFILE 'readonly';
+GRANT SELECT ON mydb.* TO ai_reader;
+```
+
+---
+
+## Operational Considerations
+
+### Logging
+
+The server uses Python's standard `logging` module with structured log messages. All logs go to stderr (stdout is reserved for the MCP protocol). Operators can control verbosity with the `LOGLEVEL` environment variable:
+
+```bash
+LOGLEVEL=DEBUG readonly-db-mcp   # Full query and connection tracing
+LOGLEVEL=INFO readonly-db-mcp    # Connection lifecycle events (default for monitoring)
+LOGLEVEL=WARNING readonly-db-mcp # Only problems (default)
+```
+
+Key events logged:
+- Connection establishment and failures (INFO)
+- Query execution with truncated SQL (DEBUG)
+- Validation errors (INFO)
+- Execution failures with full exception (ERROR)
+- Graceful degradation on startup (WARNING)
+- Reconnection attempts (WARNING)
+
+### Connection Health
+
+- **PostgreSQL**: asyncpg's connection pool automatically validates connections on acquire. Stale connections are detected and replaced transparently.
+- **ClickHouse**: Queries that fail with connection/network errors trigger automatic reconnection (one retry). The client is replaced with a fresh instance.
+
+### Graceful Degradation
+
+If configured with multiple databases (e.g., prod + staging + analytics), the server starts successfully as long as at least one database connects. Failed connections are logged but don't block startup. This improves resilience — operators can fix failing databases without downtime for the working ones.
+
+### Resource Limits
+
+- **Query timeout**: `QUERY_TIMEOUT_SECONDS` (default 30s) enforced both client-side and server-side
+- **Result size**: `MAX_RESULT_ROWS` (default 1000) enforced via LIMIT injection
+- **Connection pool**: PostgreSQL uses min=1, max=5 connections per backend
+- **Memory**: No explicit limit — relies on LIMIT injection to cap result size
+
+For production deployments, also configure database-level resource limits:
+- PostgreSQL: `statement_mem`, `work_mem`, `statement_timeout`
+- ClickHouse: `max_memory_usage`, `max_execution_time`
+
+### Security Checklist
+
+- [ ] Database users have only `SELECT` privileges
+- [ ] Database users do not own any tables
+- [ ] Database users cannot execute write-capable stored procedures
+- [ ] Use dedicated read replicas (not primary databases)
+- [ ] Set conservative `QUERY_TIMEOUT_SECONDS` (e.g., 10-30s)
+- [ ] Monitor database load and set resource limits
+- [ ] Review logs regularly for failed validation attempts
+- [ ] Keep sqlglot updated (new SQL features may need validation rules)
+
+---
+
+## Research and Background
+
+This design was informed by research into SQL injection bypasses, MCP security, and production incidents:
+
+- **sqlglot** chosen over sqlparse (tokenizer only) and pglast (PG-only) because it supports both PG and CH dialects with the same API and provides full AST access
+- **Whitelist validation** chosen over blacklist because new SQL features/keywords could bypass a blacklist — the safest approach is to only allow known-good operations
+- **Three-layer defense** because each layer alone has known bypasses (documented above in "Design Decisions")
+- The official ClickHouse MCP server had a critical vulnerability where `readonly=1` was bypassed and an AI agent dropped a production table — this motivated the defense-in-depth approach
+- Testing found that subquery wrapping breaks ORDER BY semantics in PostgreSQL, leading to the AST-based LIMIT injection approach
