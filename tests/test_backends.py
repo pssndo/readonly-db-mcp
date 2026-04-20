@@ -12,7 +12,7 @@ from readonly_db_mcp.databases.clickhouse import (
     ClickHouseBackend,
     _is_retriable_connection_error,
 )
-from readonly_db_mcp.databases.mysql import MySQLBackend
+from readonly_db_mcp.databases.mysql import MariaDBBackend, MySQLBackend
 from readonly_db_mcp.config import (
     PostgresConnection,
     ClickHouseConnection,
@@ -203,10 +203,13 @@ class TestClickHouseRetryClassification:
 
 
 class TestMySQLBackendUnit:
-    """Unit tests for MySQLBackend that don't need a running database.
+    """Unit tests for MySQLBackend / MariaDBBackend (no real DB needed).
 
-    The same backend class serves MySQL and MariaDB; the `flavor` parameter
-    selects which timeout session variable is emitted per-query.
+    MySQL and MariaDB share an implementation via a common base class
+    (`_MySQLFamilyBackend`), but each concrete subclass declares its own
+    class-level `db_type` attribute — matching the PG/CH pattern. The
+    `db_type` drives timeout-SQL selection at runtime, so the two behaviors
+    are pinned at class level rather than passed as a parameter.
     """
 
     def _make_mysql_config(self, **overrides) -> MysqlConnection:
@@ -234,19 +237,21 @@ class TestMySQLBackendUnit:
         return MariaDBConnection(**defaults)
 
     def test_ensure_connected_raises_before_connect(self) -> None:
-        backend = MySQLBackend(self._make_mysql_config(), flavor="mysql")
+        backend = MySQLBackend(self._make_mysql_config())
         with pytest.raises(RuntimeError, match="Not connected"):
             backend._ensure_connected()
 
-    def test_mysql_flavor_db_type(self) -> None:
-        backend = MySQLBackend(self._make_mysql_config(), flavor="mysql")
+    def test_mysql_db_type_is_class_level(self) -> None:
+        # db_type is declared on the class itself — matches postgres.py /
+        # clickhouse.py pattern, no per-instance shadowing.
+        assert MySQLBackend.db_type == "mysql"
+        backend = MySQLBackend(self._make_mysql_config())
         assert backend.db_type == "mysql"
-        assert backend.flavor == "mysql"
 
-    def test_mariadb_flavor_db_type(self) -> None:
-        backend = MySQLBackend(self._make_mariadb_config(), flavor="mariadb")
+    def test_mariadb_db_type_is_class_level(self) -> None:
+        assert MariaDBBackend.db_type == "mariadb"
+        backend = MariaDBBackend(self._make_mariadb_config())
         assert backend.db_type == "mariadb"
-        assert backend.flavor == "mariadb"
 
     def test_mysql_timeout_prelude_uses_max_execution_time_in_ms(self) -> None:
         """MySQL's max_execution_time is in milliseconds (SELECT-only scope)."""
@@ -254,7 +259,7 @@ class TestMySQLBackendUnit:
             postgres_connections=[], clickhouse_connections=[],
             query_timeout_seconds=30, max_result_rows=1000,
         )
-        backend = MySQLBackend(self._make_mysql_config(), config, flavor="mysql")
+        backend = MySQLBackend(self._make_mysql_config(), config)
         prelude = backend._timeout_prelude_sql()
         assert "max_execution_time" in prelude
         assert "30000" in prelude  # 30 seconds * 1000 = 30000 ms
@@ -267,7 +272,7 @@ class TestMySQLBackendUnit:
             postgres_connections=[], clickhouse_connections=[],
             query_timeout_seconds=30, max_result_rows=1000,
         )
-        backend = MySQLBackend(self._make_mariadb_config(), config, flavor="mariadb")
+        backend = MariaDBBackend(self._make_mariadb_config(), config)
         prelude = backend._timeout_prelude_sql()
         assert "max_statement_time" in prelude
         assert " = 30" in prelude  # 30 seconds, not ms
@@ -279,7 +284,7 @@ class TestMySQLBackendUnit:
             postgres_connections=[], clickhouse_connections=[],
             query_timeout_seconds=60, max_result_rows=500,
         )
-        backend = MySQLBackend(self._make_mysql_config(), config, flavor="mysql")
+        backend = MySQLBackend(self._make_mysql_config(), config)
         assert backend._timeout == 60
         assert backend._max_rows == 500
         assert backend.host == "localhost"
@@ -287,7 +292,7 @@ class TestMySQLBackendUnit:
         assert backend.name == "test_mysql"
 
     def test_constructor_defaults_without_config(self) -> None:
-        backend = MySQLBackend(self._make_mysql_config(), flavor="mysql")
+        backend = MySQLBackend(self._make_mysql_config())
         assert backend._timeout == 30
         assert backend._max_rows == 1000
 

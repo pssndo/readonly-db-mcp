@@ -31,8 +31,9 @@ src/readonly_db_mcp/
     postgres.py      # asyncpg, read-only transactions
     clickhouse.py    # clickhouse-connect, readonly=1
     mysql.py         # asyncmy, SESSION READ ONLY + START TRANSACTION READ ONLY
-                     # Shared by MySQL and MariaDB; flavor="mysql"|"mariadb"
-                     # selects the timeout session variable
+                     # MySQLBackend + MariaDBBackend share a _MySQLFamilyBackend
+                     # base; each subclass sets its own class-level db_type.
+                     # Subclass db_type drives timeout-SQL selection at runtime.
 tests/
   test_validation.py # SQL validation tests (security-critical)
   test_config.py

@@ -74,16 +74,16 @@ def _make_ch_backend(name: str = "testch") -> MagicMock:
 def _make_mysql_backend(name: str = "testmysql", db_type: str = "mysql") -> MagicMock:
     """Create a mock MySQL/MariaDB backend.
 
-    Same shape for both flavors — the only runtime difference (timeout session
-    variable) happens inside .execute() which we stub here. Pass db_type="mariadb"
-    to exercise the MariaDB routing in _get_backend.
+    The real classes are `MySQLBackend` and `MariaDBBackend` (each with its
+    own class-level db_type), but from the server's perspective the only
+    contract is the abstract DatabaseBackend method set + the db_type attr.
+    Pass db_type="mariadb" to exercise MariaDB routing in _get_backend.
     """
     backend = MagicMock()
     backend.db_type = db_type
     backend.host = "myhost"
     backend.database = "mydb"
     backend.name = name
-    backend.flavor = db_type
     backend.execute = AsyncMock(return_value=(["id", "name"], [(1, "Alice"), (2, "Bob")], 2))
     backend.list_tables = AsyncMock(return_value=["users", "orders"])
     backend.describe_table = AsyncMock(

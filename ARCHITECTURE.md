@@ -902,7 +902,7 @@ We keep them separate at the config layer because:
 2. **Distinct labels in `list_databases`.** AIs get a clearer picture of the environment when `prod_mysql (mysql)` and `legacy (mariadb)` are visibly separate.
 3. **Per-flavor tool paths.** `query_mysql` and `query_mariadb` are distinct tools. Route-by-flavor at the tool layer lets us tighten each independently in the future (e.g., adding MariaDB-specific `table_stats` fields from `information_schema.INNODB_SYS_TABLESTATS`).
 
-The backend class is shared (`MySQLBackend` with a `flavor` parameter) because the implementation is 95% identical — only the timeout-prelude SQL differs. Two classes would be duplication without benefit.
+The two backends share an implementation (`_MySQLFamilyBackend` base class) but are exposed as distinct concrete classes (`MySQLBackend`, `MariaDBBackend`), each with its own class-level `db_type` attribute. This matches the pattern in `postgres.py` and `clickhouse.py` (each of those also declares `db_type` at class scope) and means `_get_backend`'s type check sees a real class-level value rather than a per-instance attribute shadow. The shared base class carries the asyncmy pool management, transaction wrapping, identifier validation, and `information_schema` queries; the subclasses only override `db_type`, and the timeout-prelude branches on `self.db_type` at runtime.
 
 ### Why per-query `START TRANSACTION READ ONLY` on MySQL/MariaDB instead of trusting the session flag?
 

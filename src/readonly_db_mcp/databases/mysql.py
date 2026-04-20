@@ -1,13 +1,22 @@
 """
 MySQL / MariaDB backend using asyncmy with read-only transaction enforcement.
 
-This backend serves both MySQL and MariaDB. They share the MySQL wire protocol,
-asyncmy supports both, and sqlglot's "mysql" dialect handles SELECT validation
-for both. The class is parameterized by `flavor` ("mysql" or "mariadb") so:
-    - `list_databases` can label the connection correctly
-    - The per-query timeout can use the right session variable
+This module exposes two concrete backends, `MySQLBackend` and `MariaDBBackend`,
+that share all their implementation via a common base (`_MySQLFamilyBackend`).
+They're distinct classes so each can declare its own class-level `db_type`
+attribute — matching the pattern in postgres.py / clickhouse.py and letting
+`_get_backend`'s type check work without per-instance shadowing.
+
+Why share a base instead of duplicating? MySQL and MariaDB share the MySQL
+wire protocol, asyncmy supports both, and sqlglot's "mysql" dialect handles
+SELECT validation for both. The only runtime differences are:
+    - `list_databases` label (driven by `db_type`)
+    - The per-query timeout session variable
       (MySQL: `max_execution_time` in ms, SELECT-only;
        MariaDB: `max_statement_time` in seconds, all statements)
+    - A couple of SQL dialect edges (e.g. MariaDB's `ANALYZE SELECT`, which
+      we reject at the validator level anyway)
+A shared base avoids copy-pasting the transaction/LIMIT/identifier logic.
 
 Layer 2 (connection-level read-only) caveats for MySQL/MariaDB:
     Neither database has a per-connection "default_transaction_read_only"
@@ -37,7 +46,6 @@ Key concepts for non-Python readers:
 """
 
 import logging
-from typing import Literal
 
 import asyncmy
 
@@ -46,21 +54,23 @@ from .base import DatabaseBackend, inject_limit, validate_identifier
 
 logger = logging.getLogger("readonly_db_mcp.mysql")
 
-Flavor = Literal["mysql", "mariadb"]
 
+class _MySQLFamilyBackend(DatabaseBackend):
+    """Shared asyncmy implementation for MySQL and MariaDB.
 
-class MySQLBackend(DatabaseBackend):
-    """Shared asyncmy backend for MySQL and MariaDB.
-
-    The `flavor` distinguishes the two at runtime — it only affects the label
-    shown in `list_databases` and the choice of timeout session variable.
+    Subclasses declare their own class-level `db_type` ("mysql" or "mariadb").
+    This base class is not registered as a backend directly — instantiate
+    `MySQLBackend` or `MariaDBBackend` instead.
     """
+
+    # Subclasses override. Declared here for type-checker clarity; the
+    # _ensure_connected error message does not depend on it.
+    db_type: str = "mysql"
 
     def __init__(
         self,
         conn_config: MysqlConnection | MariaDBConnection,
         app_config: Config | None = None,
-        flavor: Flavor = "mysql",
     ) -> None:
         self.host = conn_config.host
         self.port = conn_config.port
@@ -68,8 +78,6 @@ class MySQLBackend(DatabaseBackend):
         self.user = conn_config.user
         self.password = conn_config.password
         self.name = conn_config.name
-        self.flavor: Flavor = flavor
-        self.db_type = flavor  # "mysql" or "mariadb" — used by _get_backend routing
         self._pool: asyncmy.Pool | None = None  # Set by connect(), None until then
         self._timeout = app_config.query_timeout_seconds if app_config else 30
         self._max_rows = app_config.max_result_rows if app_config else 1000
@@ -90,14 +98,14 @@ class MySQLBackend(DatabaseBackend):
         user's query.
 
         - MySQL: `SET @@SESSION.max_execution_time = <ms>` — applies to SELECTs
-          only (which is all we run). Ignored silently on MariaDB.
+          only (which is all we run). Unknown on MariaDB (would raise).
         - MariaDB: `SET @@SESSION.max_statement_time = <seconds>` — applies to
-          all statements. Ignored silently on MySQL.
+          all statements. Unknown on MySQL (would raise).
 
-        We emit only the variant matching the configured flavor; the other
-        would set an unknown variable and raise on some server versions.
+        We emit only the variant matching the subclass's db_type; the other
+        would set an unknown variable and raise on the server.
         """
-        if self.flavor == "mariadb":
+        if self.db_type == "mariadb":
             # MariaDB: max_statement_time is in seconds (float allowed)
             return f"SET @@SESSION.max_statement_time = {self._timeout}"
         # MySQL: max_execution_time is in milliseconds
@@ -413,7 +421,27 @@ class MySQLBackend(DatabaseBackend):
         if analyze:
             plan += (
                 "\n\n*Note: EXPLAIN ANALYZE is not supported on "
-                f"{self.flavor} via this tool because it executes the inner "
+                f"{self.db_type} via this tool because it executes the inner "
                 "query. Showing plain EXPLAIN output (plan only, no execution).*"
             )
         return plan
+
+
+class MySQLBackend(_MySQLFamilyBackend):
+    """asyncmy-based MySQL backend with read-only enforcement.
+
+    Uses `max_execution_time` (milliseconds, SELECT-only) for per-query
+    timeouts. See `_MySQLFamilyBackend` for the shared implementation.
+    """
+
+    db_type = "mysql"
+
+
+class MariaDBBackend(_MySQLFamilyBackend):
+    """asyncmy-based MariaDB backend with read-only enforcement.
+
+    Uses `max_statement_time` (seconds, applies to all statements) for
+    per-query timeouts. See `_MySQLFamilyBackend` for the shared implementation.
+    """
+
+    db_type = "mariadb"

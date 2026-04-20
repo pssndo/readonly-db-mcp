@@ -32,7 +32,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from .config import load_config, Config
 from .databases.base import DatabaseBackend, validate_identifier
 from .databases.clickhouse import ClickHouseBackend
-from .databases.mysql import MySQLBackend
+from .databases.mysql import MariaDBBackend, MySQLBackend
 from .databases.postgres import PostgresBackend
 from .formatting import format_results, format_markdown_table
 from .validation import validate_read_only
@@ -127,10 +127,11 @@ async def lifespan(server: FastMCP):
             except Exception:
                 logger.exception("Failed to connect to ClickHouse '%s' — skipping this backend", ch.name)
 
-        # Initialize MySQL connection pools (shares MySQLBackend class with MariaDB;
-        # flavor="mysql" selects MySQL-specific session variables for the timeout)
+        # Initialize MySQL connection pools. MySQLBackend and MariaDBBackend
+        # share an asyncmy-based implementation but declare distinct
+        # class-level db_type values, matching the PG/CH pattern.
         for my in config.mysql_connections:
-            backend = MySQLBackend(my, config, flavor="mysql")
+            backend = MySQLBackend(my, config)
             logger.info("Connecting to MySQL '%s' at %s:%d/%s", my.name, my.host, my.port, my.database)
             try:
                 await backend.connect()
@@ -139,10 +140,9 @@ async def lifespan(server: FastMCP):
             except Exception:
                 logger.exception("Failed to connect to MySQL '%s' — skipping this backend", my.name)
 
-        # Initialize MariaDB connection pools (same backend class, flavor="mariadb"
-        # selects MariaDB-specific session variables for the timeout)
+        # Initialize MariaDB connection pools
         for md in config.mariadb_connections:
-            backend = MySQLBackend(md, config, flavor="mariadb")
+            backend = MariaDBBackend(md, config)
             logger.info("Connecting to MariaDB '%s' at %s:%d/%s", md.name, md.host, md.port, md.database)
             try:
                 await backend.connect()
