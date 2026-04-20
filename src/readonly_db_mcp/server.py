@@ -180,25 +180,49 @@ async def lifespan(server: FastMCP):
 mcp = FastMCP("readonly-db-mcp", lifespan=lifespan)
 
 
+_QUERY_TOOL_FOR_TYPE = {
+    "postgres": "query_postgres",
+    "clickhouse": "query_clickhouse",
+    "mysql": "query_mysql",
+    "mariadb": "query_mariadb",
+}
+
+
 def _get_backend(ctx: Context, name: str | None, db_type: str | None = None) -> DatabaseBackend:
     """Resolve a database backend by name, or return the first matching type.
 
     Args:
         ctx:     The MCP context (contains the AppContext with all backends).
         name:    Specific connection name (e.g. "prod_db"). If provided, must
-                 match exactly. If None, returns the first backend of db_type.
-        db_type: Filter by type ("postgres" or "clickhouse"). Only used when
-                 name is None.
+                 match exactly.
+        db_type: Filter by type ("postgres" | "clickhouse" | "mysql" | "mariadb").
+                 If set, the resolved backend MUST be of this type regardless
+                 of whether `name` was given — this prevents cross-flavor
+                 bypasses like calling query_mariadb(database="my_postgres_conn"),
+                 which would otherwise happily run MariaDB-flavored timeout SQL
+                 against a PostgreSQL backend.
 
     Raises:
-        ValueError: If the named database doesn't exist, or no database of
-                    the requested type is configured.
+        ValueError: If the named database doesn't exist; if the named database
+                    exists but has the wrong db_type; or if no unnamed database
+                    of the requested type is configured.
     """
     app: AppContext = ctx.request_context.lifespan_context
     if name:
         if name not in app.backends:
             raise ValueError(f"Unknown database: {name}. Available: {list(app.backends.keys())}")
-        return app.backends[name]
+        backend = app.backends[name]
+        # Enforce db_type even when a name was provided. Without this check,
+        # the tool-level separation (query_postgres vs query_mysql vs ...) is
+        # advisory only — a caller could hand query_mariadb a postgres name
+        # and the validator + backend would mismatch.
+        if db_type is not None and backend.db_type != db_type:
+            correct_tool = _QUERY_TOOL_FOR_TYPE.get(backend.db_type, f"query_{backend.db_type}")
+            raise ValueError(
+                f"Database {name!r} is a {backend.db_type} connection, not {db_type}. "
+                f"Use `{correct_tool}` for this connection instead."
+            )
+        return backend
     # No name given — return the first backend matching the requested type
     for backend in app.backends.values():
         if db_type is None or backend.db_type == db_type:
@@ -768,9 +792,15 @@ for the query to succeed.
 Use `query_mysql` for MySQL connections (configured via `MYSQL_N_*` env vars)
 and `query_mariadb` for MariaDB connections (configured via `MARIADB_N_*`).
 They share most behavior but use different server-side timeout variables
-under the hood; picking the wrong tool will error at tool-selection time
-with a clear "No mysql/mariadb database configured" message, not silently
-misbehave.
+under the hood; picking the wrong tool fails fast with a clear error:
+  - If no database of the right type is configured at all, you get
+    `No mysql/mariadb database configured`.
+  - If you pass an explicit `database=` that names a different-flavored
+    connection (e.g. `query_mariadb(database="my_mysql_conn")`), you get
+    `Database 'my_mysql_conn' is a mysql connection, not mariadb.
+    Use 'query_mysql' for this connection instead.`
+Same enforcement applies across every type pair (PG/CH/MySQL/MariaDB) —
+connection-name lookups never cross flavor boundaries silently.
 
 ## Write safety (informational)
 All write operations (INSERT/UPDATE/DELETE/DDL) are rejected at the SQL

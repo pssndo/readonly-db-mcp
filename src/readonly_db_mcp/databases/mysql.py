@@ -36,12 +36,15 @@ Key concepts for non-Python readers:
       `async with conn.cursor() as cursor` opens a cursor (DB-API 2.0 style).
 """
 
+import logging
 from typing import Literal
 
 import asyncmy
 
 from ..config import Config, MariaDBConnection, MysqlConnection
 from .base import DatabaseBackend, inject_limit, validate_identifier
+
+logger = logging.getLogger("readonly_db_mcp.mysql")
 
 Flavor = Literal["mysql", "mariadb"]
 
@@ -336,9 +339,20 @@ class MySQLBackend(DatabaseBackend):
                     finally:
                         await cursor.execute("COMMIT")
         except Exception:
-            # If the user lacks SELECT on information_schema (very rare — MySQL
-            # grants it by default for all users, filtered to their own tables),
-            # silently return None rather than failing describe_table.
+            # The common failure here is lack of SELECT on information_schema
+            # (very rare — MySQL grants it by default for all users, filtered
+            # to their own tables). We return None so that describe_table still
+            # shows columns and the AI isn't blocked by a missing metadata row.
+            #
+            # But we also log the full exception at WARNING so real regressions
+            # (connection drops, bad SQL after an information_schema change, a
+            # timeout) are visible to operators tailing the server log. Without
+            # this log, a silent None return would mask actual faults and make
+            # debugging harder — which was the original reason this tool existed.
+            logger.warning(
+                "table_stats query failed for %r (returning None so describe_table "
+                "continues without metadata)", table, exc_info=True,
+            )
             return None
 
         if not row:

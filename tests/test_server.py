@@ -491,6 +491,75 @@ class TestQueryMariadb:
         mariadb.execute.assert_called_once()
 
 
+class TestCrossTypeRouting:
+    """Explicit `database=` must not cross flavor boundaries.
+
+    Before the type-enforcement fix, a caller could pass a postgres connection
+    name to query_mariadb and the tool would happily run MariaDB-flavored
+    timeout SQL against a PostgreSQL backend. These tests lock in the fix:
+    when db_type and name are both given and the named backend is a different
+    type, the tool errors with a message that points at the correct tool
+    instead of silently misrouting.
+    """
+
+    async def test_query_mariadb_rejects_mysql_connection_name(self) -> None:
+        mysql = _make_mysql_backend(name="prod_mysql", db_type="mysql")
+        mariadb = _make_mysql_backend(name="prod_mariadb", db_type="mariadb")
+        ctx = _make_ctx({"prod_mysql": mysql, "prod_mariadb": mariadb})
+
+        result = await query_mariadb("SELECT 1", ctx, database="prod_mysql")
+        assert "Error:" in result
+        assert "'prod_mysql' is a mysql connection, not mariadb" in result
+        # Points the AI at the correct tool
+        assert "query_mysql" in result
+        # Neither backend should have been asked to execute anything
+        mysql.execute.assert_not_called()
+        mariadb.execute.assert_not_called()
+
+    async def test_query_mysql_rejects_mariadb_connection_name(self) -> None:
+        mysql = _make_mysql_backend(name="prod_mysql", db_type="mysql")
+        mariadb = _make_mysql_backend(name="prod_mariadb", db_type="mariadb")
+        ctx = _make_ctx({"prod_mysql": mysql, "prod_mariadb": mariadb})
+
+        result = await query_mysql("SELECT 1", ctx, database="prod_mariadb")
+        assert "Error:" in result
+        assert "'prod_mariadb' is a mariadb connection, not mysql" in result
+        assert "query_mariadb" in result
+
+    async def test_query_postgres_rejects_clickhouse_connection_name(self) -> None:
+        pg = _make_pg_backend(name="pg1")
+        ch = _make_ch_backend(name="ch1")
+        ctx = _make_ctx({"pg1": pg, "ch1": ch})
+
+        result = await query_postgres("SELECT 1", ctx, database="ch1")
+        assert "Error:" in result
+        assert "'ch1' is a clickhouse connection, not postgres" in result
+        assert "query_clickhouse" in result
+
+    async def test_query_clickhouse_rejects_mysql_connection_name(self) -> None:
+        ch = _make_ch_backend(name="ch1")
+        mysql = _make_mysql_backend(name="mysql1", db_type="mysql")
+        ctx = _make_ctx({"ch1": ch, "mysql1": mysql})
+
+        result = await query_clickhouse("SELECT 1", ctx, database="mysql1")
+        assert "Error:" in result
+        assert "'mysql1' is a mysql connection, not clickhouse" in result
+
+    async def test_shared_tools_still_accept_any_type_by_name(self) -> None:
+        """list_tables / describe_table / sample_table / explain_query do
+        NOT pass db_type to _get_backend — they dispatch on whatever the named
+        connection happens to be. Verify the enforcement doesn't over-fire
+        and break these shared tools."""
+        mysql = _make_mysql_backend(name="any_backend", db_type="mysql")
+        ctx = _make_ctx({"any_backend": mysql})
+
+        # All of these should work against the mysql backend without error
+        result = await list_tables("any_backend", ctx)
+        assert "Error" not in result
+        result = await describe_table("any_backend", "users", ctx)
+        assert "Error" not in result
+
+
 class TestMysqlSharedTools:
     """list_tables / describe_table / sample_table / explain_query should work
     against MySQL and MariaDB backends too, since those tools dispatch by name
