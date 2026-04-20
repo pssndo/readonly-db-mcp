@@ -20,10 +20,19 @@ How it works:
         *_PASSWORD  - Password for authentication
 
     Optional env vars per connection:
-        *_PORT      - Port number (defaults: 5432 for PG, 8123 for CH)
+        *_PORT      - Port number (defaults: 5432 for PG, 8123 for CH,
+                      3306 for MySQL, 3306 for MariaDB)
         *_SECURE    - ClickHouse only: "true"/"1" to use HTTPS/TLS (default: false).
                       Required for ClickHouse Cloud, which listens on port 8443
-                      with TLS. Ignored for PostgreSQL.
+                      with TLS. Ignored for other backends.
+
+    Supported prefixes:
+        PG_N_*       - PostgreSQL
+        CH_N_*       - ClickHouse
+        MYSQL_N_*    - MySQL
+        MARIADB_N_*  - MariaDB (separate prefix from MySQL; same wire protocol
+                       but distinct at the config layer so operators can be
+                       explicit about what they're talking to)
 
     Global settings:
         QUERY_TIMEOUT_SECONDS  - Max seconds per query (default: 30)
@@ -32,7 +41,7 @@ How it works:
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -72,11 +81,47 @@ class ClickHouseConnection:
 
 
 @dataclass
+class MysqlConnection:
+    """Configuration for a single MySQL connection.
+
+    Each field maps to a MYSQL_N_* environment variable.
+    Example: MYSQL_1_HOST -> host, MYSQL_1_PORT -> port, etc.
+    """
+
+    name: str  # Friendly name (MYSQL_N_NAME), used to identify this connection in tools
+    host: str  # Server hostname (MYSQL_N_HOST)
+    port: int  # Server port (MYSQL_N_PORT, default 3306)
+    database: str  # Database name to connect to (MYSQL_N_DATABASE)
+    user: str  # Auth username (MYSQL_N_USER) — should be a read-only DB user
+    password: str  # Auth password (MYSQL_N_PASSWORD)
+
+
+@dataclass
+class MariaDBConnection:
+    """Configuration for a single MariaDB connection.
+
+    MariaDB is wire-protocol-compatible with MySQL, but we keep a separate
+    prefix (MARIADB_N_*) so operators can be explicit about which database
+    flavor they're targeting. The backend implementation is shared, but the
+    class is distinct so `list_databases` can correctly label the connection.
+    """
+
+    name: str  # Friendly name (MARIADB_N_NAME)
+    host: str  # Server hostname (MARIADB_N_HOST)
+    port: int  # Server port (MARIADB_N_PORT, default 3306)
+    database: str  # Database name to connect to (MARIADB_N_DATABASE)
+    user: str  # Auth username (MARIADB_N_USER) — should be a read-only DB user
+    password: str  # Auth password (MARIADB_N_PASSWORD)
+
+
+@dataclass
 class Config:
     """Application configuration with all database connections and global settings."""
 
     postgres_connections: list[PostgresConnection]  # All configured PG connections
     clickhouse_connections: list[ClickHouseConnection]  # All configured CH connections
+    mysql_connections: list[MysqlConnection] = field(default_factory=list)  # All configured MySQL connections
+    mariadb_connections: list[MariaDBConnection] = field(default_factory=list)  # All configured MariaDB connections
     query_timeout_seconds: int = 30  # Max seconds before a query is killed
     max_result_rows: int = 1000  # Max rows returned to the AI (rest are truncated)
 
@@ -206,11 +251,59 @@ def load_config() -> Config:
             )
         )
 
+    # ── Scan for MySQL connections ───────────────────────────────────────
+    # Same pattern: scan for known MYSQL_N_* keys and collect all unique IDs.
+    mysql_ids = sorted(
+        {
+            int(m.group(1))
+            for k in os.environ
+            if (m := re.match(r"^MYSQL_(\d+)_(NAME|HOST|PORT|DATABASE|USER|PASSWORD)$", k))
+        }
+    )
+    mysql_conns: list[MysqlConnection] = []
+    for i in mysql_ids:
+        context = f"MYSQL_{i}"
+        mysql_conns.append(
+            MysqlConnection(
+                name=_require_env(f"MYSQL_{i}_NAME", context),
+                host=_require_env(f"MYSQL_{i}_HOST", context),
+                port=int(os.environ.get(f"MYSQL_{i}_PORT", "3306")),  # Default MySQL port
+                database=_require_env(f"MYSQL_{i}_DATABASE", context),
+                user=_require_env(f"MYSQL_{i}_USER", context),
+                password=_require_env(f"MYSQL_{i}_PASSWORD", context),
+            )
+        )
+
+    # ── Scan for MariaDB connections ─────────────────────────────────────
+    # MariaDB uses a distinct prefix from MySQL. Wire protocol is the same
+    # but the backend will emit slightly different timeout SQL (max_statement_time
+    # instead of max_execution_time) based on which Connection class it's given.
+    mariadb_ids = sorted(
+        {
+            int(m.group(1))
+            for k in os.environ
+            if (m := re.match(r"^MARIADB_(\d+)_(NAME|HOST|PORT|DATABASE|USER|PASSWORD)$", k))
+        }
+    )
+    mariadb_conns: list[MariaDBConnection] = []
+    for i in mariadb_ids:
+        context = f"MARIADB_{i}"
+        mariadb_conns.append(
+            MariaDBConnection(
+                name=_require_env(f"MARIADB_{i}_NAME", context),
+                host=_require_env(f"MARIADB_{i}_HOST", context),
+                port=int(os.environ.get(f"MARIADB_{i}_PORT", "3306")),  # Default MariaDB port
+                database=_require_env(f"MARIADB_{i}_DATABASE", context),
+                user=_require_env(f"MARIADB_{i}_USER", context),
+                password=_require_env(f"MARIADB_{i}_PASSWORD", context),
+            )
+        )
+
     # At least one database must be configured, otherwise the server is useless
-    if not pg_conns and not ch_conns:
+    if not pg_conns and not ch_conns and not mysql_conns and not mariadb_conns:
         raise ValueError(
             "No database connections configured. "
-            "Set PG_1_NAME/PG_1_HOST/... or CH_1_NAME/CH_1_HOST/... environment variables."
+            "Set PG_1_NAME/..., CH_1_NAME/..., MYSQL_1_NAME/..., or MARIADB_1_NAME/... environment variables."
         )
 
     # Parse global settings with basic bounds validation
@@ -225,6 +318,8 @@ def load_config() -> Config:
     return Config(
         postgres_connections=pg_conns,
         clickhouse_connections=ch_conns,
+        mysql_connections=mysql_conns,
+        mariadb_connections=mariadb_conns,
         query_timeout_seconds=query_timeout,
         max_result_rows=max_rows,
     )

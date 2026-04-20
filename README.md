@@ -1,12 +1,12 @@
 # readonly-db-mcp
 
-Read-only MCP server for PostgreSQL and ClickHouse — safe database access for AI agents.
+Read-only MCP server for PostgreSQL, ClickHouse, MySQL, and MariaDB — safe database access for AI agents.
 
 ## What is this?
 
 This is an [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server that lets AI agents like Claude Code run SQL queries against your databases. The key constraint: **it only allows read-only queries**. The AI can look at your data but can never modify it.
 
-MCP is a standard protocol that AI tools use to call external functions ("tools"). This server exposes tools like `query_postgres` and `list_tables` that the AI discovers automatically. The AI sends a SQL query, this server validates it, runs it, and returns the results as a markdown table.
+MCP is a standard protocol that AI tools use to call external functions ("tools"). This server exposes tools like `query_postgres`, `query_mysql`, and `list_tables` that the AI discovers automatically. The AI sends a SQL query, this server validates it, runs it, and returns the results as a markdown table.
 
 ## How it keeps your data safe
 
@@ -23,8 +23,10 @@ AI Agent sends SQL
        |
        v
 [Layer 2] Connection-level read-only enforcement
-       |   PostgreSQL: default_transaction_read_only = on
-       |   ClickHouse: readonly = 1
+       |   PostgreSQL:     default_transaction_read_only = on
+       |   ClickHouse:     readonly = 1
+       |   MySQL/MariaDB:  SET SESSION TRANSACTION READ ONLY (at connect)
+       |                   + START TRANSACTION READ ONLY per query
        |   Even if Layer 1 has a bug, the database itself rejects writes.
        |
        v
@@ -38,10 +40,12 @@ AI Agent sends SQL
 
 **Why three layers?** Each layer alone has known bypasses:
 - Layer 1 (SQL parsing) can't detect side effects in stored procedures
-- Layer 2 (PG `default_transaction_read_only`) can be overridden by `SET` (which Layer 1 blocks)
+- Layer 2 (PG `default_transaction_read_only`, MySQL/MariaDB `SESSION TRANSACTION READ ONLY`) can be overridden by `SET` (which Layer 1 blocks). For MySQL/MariaDB Layer 2 is also slightly weaker than PG's because there's no server-enforced pool-level flag — we compensate by wrapping every query in `START TRANSACTION READ ONLY` explicitly.
 - Layer 3 (DB user privileges) depends on the operator configuring it correctly
 
 Together, they provide defense in depth.
+
+**MySQL/MariaDB `EXPLAIN ANALYZE` warning.** In MySQL 8.0.18+ and MariaDB, `EXPLAIN ANALYZE <stmt>` and MariaDB's `ANALYZE <stmt>` **actually execute** the inner query to collect timing data (same semantics as PostgreSQL's `EXPLAIN ANALYZE`). This tool's `explain_query` always runs plain `EXPLAIN` (plan-only, no execution) for MySQL and MariaDB, regardless of the `analyze` flag, and rejects raw `EXPLAIN ANALYZE ...` sent via `query_mysql` / `query_mariadb` at the SQL validation layer.
 
 ### Important: Layer 3 is not optional
 
@@ -68,6 +72,7 @@ src/readonly_db_mcp/
     base.py            # Abstract interface that all DB backends implement
     postgres.py        # PostgreSQL backend (asyncpg, connection pool, read-only txns)
     clickhouse.py      # ClickHouse backend (clickhouse-connect, readonly=1)
+    mysql.py           # MySQL + MariaDB backend (asyncmy pool, SESSION READ ONLY + START TRANSACTION READ ONLY)
 tests/
   test_validation.py   # SQL validation tests (the critical security tests)
   test_config.py       # Config parsing tests
@@ -133,6 +138,25 @@ CH_1_DATABASE=events
 CH_1_USER=ai_reader
 CH_1_PASSWORD=secret
 
+# MySQL connections (MYSQL_1_, MYSQL_2_, etc.)
+MYSQL_1_NAME=primary_mysql
+MYSQL_1_HOST=mysql-prod.internal
+MYSQL_1_PORT=3306               # optional, defaults to 3306
+MYSQL_1_DATABASE=myapp
+MYSQL_1_USER=ai_reader
+MYSQL_1_PASSWORD=secret
+
+# MariaDB connections (MARIADB_1_, MARIADB_2_, etc.)
+# Separate prefix from MySQL. Same wire protocol, but kept distinct so
+# operators can be explicit — and so query_mariadb uses MariaDB-specific
+# timeout semantics (max_statement_time in seconds vs MySQL's max_execution_time in ms).
+MARIADB_1_NAME=legacy
+MARIADB_1_HOST=mariadb-prod.internal
+MARIADB_1_PORT=3306             # optional, defaults to 3306
+MARIADB_1_DATABASE=legacy_app
+MARIADB_1_USER=ai_reader
+MARIADB_1_PASSWORD=secret
+
 # Global settings (optional)
 QUERY_TIMEOUT_SECONDS=30        # Max seconds per query (default: 30)
 MAX_RESULT_ROWS=1000            # Max rows returned (default: 1000, rest truncated)
@@ -174,16 +198,20 @@ Claude Code auto-discovers the tools. No further setup needed.
 
 ## MCP tools
 
-Six tools are exposed to the AI agent:
+Ten tools are exposed to the AI agent:
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `query_postgres` | `sql`, `database?` | Run a read-only SQL query against PostgreSQL |
-| `query_clickhouse` | `sql`, `database?` | Run a read-only SQL query against ClickHouse |
+| `query_postgres` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against PostgreSQL |
+| `query_clickhouse` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against ClickHouse |
+| `query_mysql` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MySQL |
+| `query_mariadb` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MariaDB |
 | `list_databases` | (none) | List all configured database connections |
 | `list_tables` | `database` | List all tables in a database |
-| `describe_table` | `database`, `table` | Show columns, types, and nullability |
+| `describe_table` | `database`, `table` | Columns, types, nullability (+ engine/rows/keys for CH and MySQL/MariaDB) |
+| `sample_table` | `database`, `table`, `n?`, `output_format?` | First N rows of a table (validated `SELECT * LIMIT n`) |
 | `explain_query` | `sql`, `database`, `analyze?` | Show the query execution plan |
+| `usage_guide` | (none) | Returns a cheatsheet — call once to learn the full tool surface |
 
 ## Database user setup
 
@@ -208,6 +236,26 @@ CREATE USER ai_reader IDENTIFIED BY 'strong_password_here'
 GRANT SELECT ON mydb.* TO ai_reader;
 ```
 
+### MySQL
+
+```sql
+CREATE USER 'ai_reader'@'%' IDENTIFIED BY 'strong_password_here';
+GRANT SELECT ON myapp.* TO 'ai_reader'@'%';
+```
+
+**Do not** grant `EXECUTE`, `TRIGGER`, `CREATE ROUTINE`, or any DML. Granting `EXECUTE` on stored functions is especially risky because `SELECT my_write_function()` parses as a pure SELECT but can perform writes inside the function body — this is the classic bypass that Layer 3 (DB privileges) exists to prevent.
+
+(`FLUSH PRIVILEGES` is **not** needed here. It's only required when modifying the `mysql.user` table directly; `CREATE USER` / `GRANT` update the in-memory privilege cache automatically.)
+
+### MariaDB
+
+```sql
+CREATE USER 'ai_reader'@'%' IDENTIFIED BY 'strong_password_here';
+GRANT SELECT ON legacy_app.* TO 'ai_reader'@'%';
+```
+
+Same privilege posture as MySQL.
+
 ## Known limitations
 
 ### No rate limiting or query cost estimation
@@ -220,7 +268,11 @@ The server does not currently limit how many queries an AI agent can run or esti
 **Mitigations:**
 - Set conservative `QUERY_TIMEOUT_SECONDS` and `MAX_RESULT_ROWS` limits
 - Use a dedicated read replica for AI queries (not the primary database)
-- Monitor database load and set resource limits at the database level (e.g., PostgreSQL's `statement_mem`, ClickHouse's `max_memory_usage`)
+- Monitor database load and set resource limits at the database level:
+  - PostgreSQL: `statement_timeout`, `statement_mem`, `work_mem`
+  - ClickHouse: `max_memory_usage`, `max_execution_time`
+  - MySQL: `max_execution_time` (SELECT-only, ms), `max_allowed_packet`
+  - MariaDB: `max_statement_time` (all statements, seconds)
 - Run the MCP server in an environment where you can control/rate-limit the AI agent's access
 
 ### Stored procedures can bypass SQL validation

@@ -228,3 +228,62 @@ class TestErgonomicHints:
         The validator MUST reject this — the hint path is only for error messaging."""
         with pytest.raises(ValueError):
             validate_read_only("EXPLAIN ANALYZE DELETE FROM users", dialect="postgres")
+
+    def test_mysql_explain_analyze_delete_still_rejected(self) -> None:
+        """Same concern for MySQL 8.0.18+ where EXPLAIN ANALYZE actually executes
+        the inner query. The validator must reject this regardless of dialect."""
+        with pytest.raises(ValueError):
+            validate_read_only("EXPLAIN ANALYZE DELETE FROM users", dialect="mysql")
+
+
+class TestMysqlDialectQueries:
+    """Validator parity for MySQL/MariaDB dialect (shared dialect handles both)."""
+
+    def test_simple_select_passes(self) -> None:
+        validate_read_only("SELECT * FROM users", dialect="mysql")
+
+    def test_backtick_identifiers(self) -> None:
+        """MySQL uses backticks for quoted identifiers — must parse cleanly."""
+        validate_read_only("SELECT `id`, `name` FROM `users`", dialect="mysql")
+
+    def test_mysql_limit_offset(self) -> None:
+        validate_read_only("SELECT * FROM users LIMIT 10 OFFSET 20", dialect="mysql")
+
+    def test_mysql_insert_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("INSERT INTO users VALUES (1, 'x')", dialect="mysql")
+
+    def test_mysql_update_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("UPDATE users SET name = 'x' WHERE id = 1", dialect="mysql")
+
+    def test_mysql_delete_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("DELETE FROM users WHERE id = 1", dialect="mysql")
+
+    def test_mysql_truncate_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            validate_read_only("TRUNCATE TABLE users", dialect="mysql")
+
+    def test_mysql_cte_with_delete_rejected(self) -> None:
+        """MySQL 8.0+ supports CTEs. Writes hidden in CTEs must still be caught."""
+        with pytest.raises(ValueError):
+            validate_read_only(
+                "WITH del AS (DELETE FROM users WHERE id = 1 RETURNING *) SELECT * FROM del",
+                dialect="mysql",
+            )
+
+    def test_mysql_show_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="list_tables"):
+            validate_read_only("SHOW TABLES", dialect="mysql")
+
+    def test_mysql_describe_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="describe_table"):
+            validate_read_only("DESCRIBE users", dialect="mysql")
+
+    def test_mariadb_analyze_select_rejected(self) -> None:
+        """MariaDB's `ANALYZE SELECT ...` executes the inner query.
+        The validator parses `ANALYZE` as a Command (not a SELECT root),
+        so it must be rejected."""
+        with pytest.raises(ValueError):
+            validate_read_only("ANALYZE SELECT * FROM users", dialect="mysql")

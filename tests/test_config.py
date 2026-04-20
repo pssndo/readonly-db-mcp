@@ -129,7 +129,7 @@ class TestLoadConfig:
         # monkeypatch.delenv with raising=False is a no-op if the var doesn't exist.
         # Use a wide range (1-100) since the loader scans all env vars by regex
         # and doesn't stop at gaps — PG_50_NAME would still be found.
-        for prefix in ("PG_", "CH_"):
+        for prefix in ("PG_", "CH_", "MYSQL_", "MARIADB_"):
             for i in range(1, 101):
                 for suffix in ("NAME", "HOST", "PORT", "DATABASE", "USER", "PASSWORD", "SECURE"):
                     monkeypatch.delenv(f"{prefix}{i}_{suffix}", raising=False)
@@ -263,3 +263,88 @@ class TestLoadConfig:
         monkeypatch.setenv("MAX_RESULT_ROWS", "0")
         with pytest.raises(ValueError, match="MAX_RESULT_ROWS must be >= 1"):
             load_config()
+
+
+class TestMysqlMariadbConfig:
+    """MySQL (MYSQL_N_*) and MariaDB (MARIADB_N_*) env-var parsing."""
+
+    def test_mysql_basic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MYSQL_1_NAME", "primary_mysql")
+        monkeypatch.setenv("MYSQL_1_HOST", "mysql.internal")
+        monkeypatch.setenv("MYSQL_1_DATABASE", "app")
+        monkeypatch.setenv("MYSQL_1_USER", "ai_reader")
+        monkeypatch.setenv("MYSQL_1_PASSWORD", "secret")
+
+        config = load_config()
+        assert len(config.mysql_connections) == 1
+        assert config.mysql_connections[0].name == "primary_mysql"
+        assert config.mysql_connections[0].host == "mysql.internal"
+        assert config.mysql_connections[0].port == 3306  # default
+        assert config.mariadb_connections == []
+
+    def test_mariadb_basic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MARIADB_1_NAME", "legacy")
+        monkeypatch.setenv("MARIADB_1_HOST", "mariadb.internal")
+        monkeypatch.setenv("MARIADB_1_DATABASE", "legacy_app")
+        monkeypatch.setenv("MARIADB_1_USER", "reader")
+        monkeypatch.setenv("MARIADB_1_PASSWORD", "secret")
+
+        config = load_config()
+        assert len(config.mariadb_connections) == 1
+        assert config.mariadb_connections[0].name == "legacy"
+        assert config.mariadb_connections[0].port == 3306  # default
+        assert config.mysql_connections == []
+
+    def test_mysql_and_mariadb_coexist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MYSQL_* and MARIADB_* are separate prefixes; both can be configured."""
+        monkeypatch.setenv("MYSQL_1_NAME", "mysql_prod")
+        monkeypatch.setenv("MYSQL_1_HOST", "h1")
+        monkeypatch.setenv("MYSQL_1_DATABASE", "d1")
+        monkeypatch.setenv("MYSQL_1_USER", "u")
+        monkeypatch.setenv("MYSQL_1_PASSWORD", "p")
+
+        monkeypatch.setenv("MARIADB_1_NAME", "maria_legacy")
+        monkeypatch.setenv("MARIADB_1_HOST", "h2")
+        monkeypatch.setenv("MARIADB_1_DATABASE", "d2")
+        monkeypatch.setenv("MARIADB_1_USER", "u")
+        monkeypatch.setenv("MARIADB_1_PASSWORD", "p")
+
+        config = load_config()
+        assert len(config.mysql_connections) == 1
+        assert len(config.mariadb_connections) == 1
+        assert config.mysql_connections[0].name == "mysql_prod"
+        assert config.mariadb_connections[0].name == "maria_legacy"
+
+    def test_mysql_custom_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MYSQL_1_NAME", "mydb")
+        monkeypatch.setenv("MYSQL_1_HOST", "h")
+        monkeypatch.setenv("MYSQL_1_PORT", "3307")
+        monkeypatch.setenv("MYSQL_1_DATABASE", "d")
+        monkeypatch.setenv("MYSQL_1_USER", "u")
+        monkeypatch.setenv("MYSQL_1_PASSWORD", "p")
+
+        config = load_config()
+        assert config.mysql_connections[0].port == 3307
+
+    def test_mysql_missing_required_field_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # HOST set but no NAME — loader scans all known suffixes to discover IDs,
+        # so the partial config is detected and the missing NAME is reported.
+        monkeypatch.setenv("MYSQL_1_HOST", "h")
+        monkeypatch.setenv("MYSQL_1_DATABASE", "d")
+        monkeypatch.setenv("MYSQL_1_USER", "u")
+        monkeypatch.setenv("MYSQL_1_PASSWORD", "p")
+        with pytest.raises(ValueError, match="MYSQL_1_NAME"):
+            load_config()
+
+    def test_multiple_mysql_connections(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for i in (1, 2):
+            monkeypatch.setenv(f"MYSQL_{i}_NAME", f"mysql{i}")
+            monkeypatch.setenv(f"MYSQL_{i}_HOST", f"host{i}")
+            monkeypatch.setenv(f"MYSQL_{i}_DATABASE", f"db{i}")
+            monkeypatch.setenv(f"MYSQL_{i}_USER", "u")
+            monkeypatch.setenv(f"MYSQL_{i}_PASSWORD", "p")
+
+        config = load_config()
+        assert len(config.mysql_connections) == 2
+        assert config.mysql_connections[0].name == "mysql1"
+        assert config.mysql_connections[1].name == "mysql2"
