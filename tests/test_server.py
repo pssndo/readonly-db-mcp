@@ -297,24 +297,60 @@ class TestUsageGuide:
 
 
 class TestQueryOutputFormats:
-    """query_* tools should honor the output_format param."""
+    """query_* tools should honor the output_format param — tested for both backends
+    to prevent format regressions slipping in via one path but not the other."""
 
-    async def test_json_format(self) -> None:
+    # ── PostgreSQL ───────────────────────────────────────────────────────
+
+    async def test_pg_json_format(self) -> None:
         import json as _json
         ctx = _make_ctx({"testpg": _make_pg_backend()})
         result = await query_postgres("SELECT * FROM users", ctx, output_format="json")
+        # JSON output is a strict envelope — always valid JSON, always same shape.
         data = _json.loads(result)
-        assert data == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        assert data["columns"] == ["id", "name"]
+        assert data["rows"] == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        assert data["truncated"] is False
 
-    async def test_vertical_format(self) -> None:
+    async def test_pg_vertical_format(self) -> None:
         ctx = _make_ctx({"testpg": _make_pg_backend()})
         result = await query_postgres("SELECT * FROM users", ctx, output_format="vertical")
         assert "-[ RECORD 1 ]-" in result
 
-    async def test_invalid_format(self) -> None:
+    async def test_pg_invalid_format(self) -> None:
         ctx = _make_ctx({"testpg": _make_pg_backend()})
         result = await query_postgres("SELECT * FROM users", ctx, output_format="xml")
         assert "Error:" in result
+
+    # ── ClickHouse (parity) ──────────────────────────────────────────────
+
+    async def test_ch_json_format(self) -> None:
+        import json as _json
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx, output_format="json")
+        data = _json.loads(result)
+        assert data["columns"] == ["count()"]
+        assert data["rows"] == [{"count()": 42}]
+        assert data["truncated"] is False
+
+    async def test_ch_vertical_format(self) -> None:
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx, output_format="vertical")
+        assert "-[ RECORD 1 ]-" in result
+        assert "count() = 42" in result
+
+    async def test_ch_invalid_format(self) -> None:
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT 1", ctx, output_format="xml")
+        assert "Error:" in result
+        assert "output_format" in result
+
+    async def test_ch_table_format_default(self) -> None:
+        """Default format is markdown table for ClickHouse too."""
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx)
+        assert "| count() |" in result
+        assert "| 42 |" in result
 
 
 class TestErrorForwarding:

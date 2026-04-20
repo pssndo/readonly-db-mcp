@@ -182,7 +182,9 @@ class TestVerticalFormat:
 
 
 class TestJsonFormat:
-    def test_basic_json(self) -> None:
+    """Contract: output_format="json" always returns strictly parseable JSON."""
+
+    def test_basic_json_envelope(self) -> None:
         result = format_results(
             columns=["id", "name"],
             rows=[(1, "Alice"), (2, "Bob")],
@@ -190,7 +192,12 @@ class TestJsonFormat:
             output_format="json",
         )
         data = json.loads(result)
-        assert data == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        assert data == {
+            "columns": ["id", "name"],
+            "rows": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
+            "shown": 2,
+            "truncated": False,
+        }
 
     def test_json_null(self) -> None:
         result = format_results(
@@ -200,7 +207,7 @@ class TestJsonFormat:
             output_format="json",
         )
         data = json.loads(result)
-        assert data == [{"id": 1, "email": None}]
+        assert data["rows"] == [{"id": 1, "email": None}]
 
     def test_json_no_cell_truncation(self) -> None:
         long_value = "z" * 500
@@ -211,20 +218,23 @@ class TestJsonFormat:
             output_format="json",
         )
         data = json.loads(result)
-        assert data[0]["data"] == long_value
+        assert data["rows"][0]["data"] == long_value
 
-    def test_json_truncation_note_appended_outside_array(self) -> None:
+    def test_json_truncation_marks_envelope_but_stays_valid_json(self) -> None:
+        # Regression: previously appended a markdown note AFTER the JSON array,
+        # which broke json.loads() on the raw result. Now the envelope carries
+        # truncation state as a field, and the whole payload is strictly JSON.
         result = format_results(
             columns=["id"],
             rows=[(1,), (2,)],
             total_count=100,
             output_format="json",
         )
-        # The JSON body is on the first line; the note is appended after.
-        first_line = result.splitlines()[0]
-        data = json.loads(first_line)
-        assert data == [{"id": 1}, {"id": 2}]
-        assert "results truncated" in result
+        # The ENTIRE result is valid JSON (no markdown note appended)
+        data = json.loads(result)
+        assert data["rows"] == [{"id": 1}, {"id": 2}]
+        assert data["shown"] == 2
+        assert data["truncated"] is True
 
     def test_json_coerces_bytes_to_string(self) -> None:
         result = format_results(
@@ -234,4 +244,4 @@ class TestJsonFormat:
             output_format="json",
         )
         data = json.loads(result)
-        assert data == [{"data": "hello"}]
+        assert data["rows"] == [{"data": "hello"}]

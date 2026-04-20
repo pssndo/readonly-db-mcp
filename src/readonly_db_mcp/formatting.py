@@ -5,8 +5,10 @@ Three output formats are supported (selectable per-query):
     - "table"    (default): markdown table, compact, best for many rows with short values
     - "vertical" (\\gx-style): each row expanded into column=value pairs, no truncation,
                  ideal for wide cells (DDL strings, JSON blobs) or single-row results
-    - "json":    machine-readable JSON array of {column: value} objects, no truncation,
-                 for when the AI needs to programmatically process the result
+    - "json":    machine-readable JSON envelope
+                 {"columns": [...], "rows": [{column: value}, ...], "shown": N,
+                 "truncated": bool}, no truncation, for when the AI needs to
+                 programmatically process the result
 
 Heuristic: when format="table" is requested but a cell exceeds the truncation limit,
 the formatter automatically falls back to "vertical" for single-row results so the AI
@@ -35,7 +37,9 @@ Example outputs:
         name = Bob
 
     json:
-        [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        {"columns": ["id", "name"],
+         "rows": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
+         "shown": 2, "truncated": false}
 """
 
 import json
@@ -61,7 +65,8 @@ def format_results(
         columns:       List of column names.
         rows:          List of row tuples (one value per column).
         total_count:   Row count from the backend (used to detect truncation).
-                       If larger than len(rows), a truncation note is appended.
+                       If larger than len(rows), output indicates truncation
+                       (note in table/vertical, flag in json envelope).
         output_format: "table" | "vertical" | "json". See module docstring.
 
     Returns:
@@ -152,15 +157,32 @@ def _format_vertical(columns: list[str], rows: list[tuple], total_count: int) ->
 
 
 def _format_json(columns: list[str], rows: list[tuple], total_count: int) -> str:
-    """Render as a JSON array of {column: value} objects (no cell truncation)."""
+    """Render as a JSON envelope — always strictly parseable by json.loads().
+
+    The envelope has a fixed shape regardless of truncation or row count:
+        {
+          "columns": [col1, col2, ...],     # schema, useful even for 0 rows
+          "rows":    [{col: val, ...}, ...],
+          "shown":   N,                      # len(rows)
+          "truncated": bool                  # true if backend capped results
+        }
+
+    Contract: the returned string is ALWAYS valid JSON. Clients can safely
+    do `json.loads(result)` without splitting on newlines or checking for
+    appended markdown notes. A `.get("truncated")` check tells them whether
+    to prompt for more specific query criteria.
+    """
     records = [
         {col: _json_safe(val) for col, val in zip(columns, row)}
         for row in rows
     ]
-    body = json.dumps(records, ensure_ascii=False, default=str)
-    if total_count > len(rows):
-        return body + f"\n\n*Showing first {len(rows)} rows (results truncated).*"
-    return body
+    envelope = {
+        "columns": columns,
+        "rows": records,
+        "shown": len(records),
+        "truncated": total_count > len(rows),
+    }
+    return json.dumps(envelope, ensure_ascii=False, default=str)
 
 
 def _json_safe(val: object) -> object:

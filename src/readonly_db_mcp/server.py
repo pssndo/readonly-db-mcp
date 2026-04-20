@@ -539,16 +539,13 @@ set up by the operator at server startup.
 
 ## Tools (prefer dedicated tools over raw SQL where possible)
 
-| Tool              | When to use                                              |
-| ----------------- | -------------------------------------------------------- |
-| `list_databases`  | See configured connections. Start here when exploring.   |
-| `list_tables`     | See tables in a connection. Don't write `SHOW TABLES`.   |
-| `describe_table`  | Columns + types (CH also returns engine, row/byte stats, |
-|                   | keys). Don't write `DESCRIBE`.                           |
-| `sample_table`    | First N rows (default 5). Replaces "SELECT * LIMIT 5".   |
-| `query_postgres`  | Ad-hoc SELECT against a PostgreSQL connection.           |
-| `query_clickhouse`| Ad-hoc SELECT against a ClickHouse connection.           |
-| `explain_query`   | Execution plan. Don't write `EXPLAIN`.                   |
+- `list_databases` — See configured connections. Start here when exploring.
+- `list_tables` — See tables in a connection. Don't write `SHOW TABLES`.
+- `describe_table` — Columns + types; for ClickHouse also returns engine, row/byte stats, and keys. Don't write `DESCRIBE`.
+- `sample_table` — First N rows (default 5). Replaces "SELECT * LIMIT 5".
+- `query_postgres` — Ad-hoc SELECT against a PostgreSQL connection.
+- `query_clickhouse` — Ad-hoc SELECT against a ClickHouse connection.
+- `explain_query` — Execution plan. Don't write `EXPLAIN`.
 
 ## Typical workflow
 1. `list_databases` → pick a connection
@@ -563,7 +560,7 @@ set up by the operator at server startup.
   don't lose data.
 - `"vertical"` — psql `\\gx`-style one-column-per-line. Best for wide values
   (DDL strings, JSON blobs), or single-row lookups.
-- `"json"` — machine-readable JSON array of objects, no cell truncation.
+- `"json"` — strict JSON envelope `{{"columns": [...], "rows": [{{"col": "val", ...}}, ...], "shown": N, "truncated": bool}}`. Always valid JSON (truncation is carried as a field, never as a trailing note). No cell truncation.
 
 ## ClickHouse schemas
 The `database` param picks the *connection*, not the schema. Fully qualify

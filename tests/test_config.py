@@ -79,6 +79,19 @@ class TestLoadConfig:
             config = load_config()
             assert config.clickhouse_connections[0].secure is False, f"Expected False for {value!r}"
 
+    def test_clickhouse_secure_rejects_unknown_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CH_N_SECURE must fail fast on typos — silently defaulting to False
+        would disable TLS intent and send credentials in cleartext."""
+        monkeypatch.setenv("CH_1_NAME", "ch")
+        monkeypatch.setenv("CH_1_HOST", "h")
+        monkeypatch.setenv("CH_1_DATABASE", "d")
+        monkeypatch.setenv("CH_1_USER", "u")
+        monkeypatch.setenv("CH_1_PASSWORD", "p")
+        for bad_value in ("treu", "enable", "secure", "2", "tru"):
+            monkeypatch.setenv("CH_1_SECURE", bad_value)
+            with pytest.raises(ValueError, match="CH_1_SECURE"):
+                load_config()
+
     def test_multiple_postgres(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for i in (1, 2):
             monkeypatch.setenv(f"PG_{i}_NAME", f"db{i}")

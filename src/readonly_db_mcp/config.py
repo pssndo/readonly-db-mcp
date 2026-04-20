@@ -81,15 +81,37 @@ class Config:
     max_result_rows: int = 1000  # Max rows returned to the AI (rest are truncated)
 
 
-def _parse_bool(raw: str | None, *, default: bool = False) -> bool:
+_TRUTHY = {"true", "1", "yes", "on"}
+_FALSY = {"false", "0", "no", "off", ""}
+
+
+def _parse_bool(raw: str | None, *, key: str, default: bool = False) -> bool:
     """Parse a truthy string from env vars. Accepts common variants (case-insensitive).
 
     Truthy: "true", "1", "yes", "on"
     Falsy:  "false", "0", "no", "off", "" (empty)
+
+    Raises ValueError for any other value — a typo like "treu" must fail fast
+    rather than silently default to False, which would disable TLS intent for
+    security-sensitive flags like CH_N_SECURE.
+
+    Args:
+        raw:     The env var value (or None if unset).
+        key:     The env var name, used only in the error message so the
+                 operator can find the offending variable.
+        default: Returned when raw is None (unset). Not used for empty-string.
     """
     if raw is None:
         return default
-    return raw.strip().lower() in {"true", "1", "yes", "on"}
+    normalized = raw.strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    raise ValueError(
+        f"Invalid boolean value for {key}={raw!r}. "
+        f"Expected one of: true/false, 1/0, yes/no, on/off (case-insensitive)."
+    )
 
 
 def _require_env(key: str, context: str) -> str:
@@ -176,7 +198,11 @@ def load_config() -> Config:
                 database=_require_env(f"CH_{i}_DATABASE", context),
                 user=_require_env(f"CH_{i}_USER", context),
                 password=_require_env(f"CH_{i}_PASSWORD", context),
-                secure=_parse_bool(os.environ.get(f"CH_{i}_SECURE"), default=False),
+                secure=_parse_bool(
+                    os.environ.get(f"CH_{i}_SECURE"),
+                    key=f"CH_{i}_SECURE",
+                    default=False,
+                ),
             )
         )
 
