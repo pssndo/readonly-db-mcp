@@ -214,6 +214,20 @@ class DatabaseBackend(ABC):
         """
         ...
 
+    async def table_stats(self, table: str) -> dict | None:
+        """Return backend-specific metadata about a table (engine, row count, size, etc.).
+
+        Returns None if the backend has no useful metadata to offer beyond
+        columns, or if the table does not exist. The default implementation
+        returns None; backends that can provide richer metadata (like ClickHouse's
+        system.tables) override this.
+
+        The returned dict is free-form — the server renders whatever keys are
+        present. Common keys: "engine", "total_rows", "total_bytes",
+        "primary_key", "partition_key", "sorting_key".
+        """
+        return None
+
     @abstractmethod
     async def explain(self, sql: str, analyze: bool = False) -> str:
         """

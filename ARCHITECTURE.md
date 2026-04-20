@@ -158,29 +158,31 @@ Claude Code auto-discovers the tools. No further setup.
 
 ## MCP Tools
 
-Six tools are exposed to the AI:
+Eight tools are exposed to the AI. Dedicated tools should be preferred over raw SQL where available — they're cheaper, clearer, and don't hit the "SELECT-only" rejection path.
 
 ### 1. `query_postgres`
 
 Execute a read-only SQL query against PostgreSQL.
 
-| Parameter  | Type   | Required | Description                                     |
-| ---------- | ------ | -------- | ----------------------------------------------- |
-| `sql`      | string | yes      | The SQL query                                   |
-| `database` | string | no       | Named PG connection (default: first configured) |
+| Parameter       | Type   | Required | Description                                                     |
+| --------------- | ------ | -------- | --------------------------------------------------------------- |
+| `sql`           | string | yes      | The SQL query                                                   |
+| `database`      | string | no       | Named PG **connection** (default: first configured)             |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`                 |
 
-Returns: markdown table of results.
+Returns: results rendered in the requested format.
 
 ### 2. `query_clickhouse`
 
 Execute a read-only SQL query against ClickHouse.
 
-| Parameter  | Type   | Required | Description                                     |
-| ---------- | ------ | -------- | ----------------------------------------------- |
-| `sql`      | string | yes      | The SQL query                                   |
-| `database` | string | no       | Named CH connection (default: first configured) |
+| Parameter       | Type   | Required | Description                                                     |
+| --------------- | ------ | -------- | --------------------------------------------------------------- |
+| `sql`           | string | yes      | The SQL query (fully-qualify tables outside the default schema) |
+| `database`      | string | no       | Named CH **connection** (default: first configured)             |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`                 |
 
-Returns: markdown table of results.
+Returns: results rendered in the requested format.
 
 ### 3. `list_databases`
 
@@ -190,7 +192,7 @@ List all configured database connections.
 | --------- | ---- | -------- | ----------- |
 | (none)    |      |          |             |
 
-Returns: list of `{name, type, host, database}`.
+Returns: list of `{name, type, host, database}`. The `name` is what you pass as `database=...` to other tools — it's an alias, **not** a PG schema or CH database.
 
 ### 4. `list_tables`
 
@@ -198,32 +200,55 @@ List tables in a database.
 
 | Parameter  | Type   | Required | Description      |
 | ---------- | ------ | -------- | ---------------- |
-| `database` | string | yes      | Named connection |
+| `database` | string | yes      | Connection name  |
 
-Returns: list of table names (with schema for PG).
+Returns: list of table names (with schema for PG; in the connection's default schema only for CH).
 
 ### 5. `describe_table`
 
-Show columns, types, and nullability for a table.
+Show columns, types, and nullability for a table. For ClickHouse, also returns engine, total_rows, total_bytes, primary_key, sorting_key, and partition_key (read from `system.tables`, silently skipped if the user lacks that grant).
 
-| Parameter  | Type   | Required | Description                        |
-| ---------- | ------ | -------- | ---------------------------------- |
-| `database` | string | yes      | Named connection                   |
-| `table`    | string | yes      | Table name (`schema.table` for PG) |
+| Parameter  | Type   | Required | Description                                                    |
+| ---------- | ------ | -------- | -------------------------------------------------------------- |
+| `database` | string | yes      | Connection name                                                |
+| `table`    | string | yes      | `schema.table` (PG) or `table` / `db.table` (CH)               |
 
-Returns: markdown table of column definitions.
+Returns: markdown table of column definitions, plus an optional metadata section.
 
-### 6. `explain_query`
+### 6. `sample_table`
+
+Return the first N rows of a table — the "give me a peek" shortcut.
+
+| Parameter       | Type   | Required | Description                                                  |
+| --------------- | ------ | -------- | ------------------------------------------------------------ |
+| `database`      | string | yes      | Connection name                                              |
+| `table`         | string | yes      | Table name (same rules as `describe_table`)                  |
+| `n`             | int    | no       | Number of rows (1..MAX_RESULT_ROWS, default 5)               |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`              |
+
+Internally issues `SELECT * FROM <safe_table> LIMIT <n>` through the same validation path as `query_*`. Table names are validated against the safe-identifier regex before interpolation.
+
+### 7. `explain_query`
 
 Show the query execution plan.
 
-| Parameter  | Type    | Required | Description                          |
-| ---------- | ------- | -------- | ------------------------------------ |
-| `sql`      | string  | yes      | The SQL query                        |
-| `database` | string  | yes      | Named connection                     |
-| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (default: false) |
+| Parameter  | Type    | Required | Description                                                  |
+| ---------- | ------- | -------- | ------------------------------------------------------------ |
+| `sql`      | string  | yes      | The SELECT query to explain (validated as read-only first)   |
+| `database` | string  | yes      | Connection name                                              |
+| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (PG only; ignored for CH, default false) |
 
-Returns: query plan as text.
+Returns: query plan as text. The inner SQL is validated as read-only *before* EXPLAIN is prepended, which blocks the `EXPLAIN ANALYZE DELETE ...` bypass in PostgreSQL.
+
+### 8. `usage_guide`
+
+Return a cheatsheet describing all tools, typical workflows, output formats, and schema-qualification rules. Use when unsure which tool to reach for.
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| (none)    |      |          |             |
+
+Returns: a markdown guide covering the full tool surface plus the configured connections.
 
 ---
 
@@ -683,47 +708,34 @@ def load_config() -> Config:
 
 ## Formatting Module Notes
 
-```python
-# src/readonly_db_mcp/formatting.py
+The formatter supports three output formats selectable per-query via
+`output_format` on `query_postgres` / `query_clickhouse` / `sample_table`:
 
-def format_markdown_table(columns: list[str], rows: list[tuple], total_count: int) -> str:
-    """
-    Format query results as a markdown table.
-    If rows were truncated, append a note.
-    """
-    if not columns:
-        return "Query returned no columns."
-    if not rows:
-        return "Query returned 0 rows."
+| Format      | Use when                                                          | Cell truncation |
+| ----------- | ----------------------------------------------------------------- | --------------- |
+| `table`     | Many rows with short values (default)                             | Yes, at 200 chars |
+| `vertical`  | Wide values (DDL strings, JSON blobs) or single-row inspection    | None            |
+| `json`      | Programmatic post-processing by the AI                            | None            |
 
-    # Header
-    header = "| " + " | ".join(str(c) for c in columns) + " |"
-    separator = "| " + " | ".join("---" for _ in columns) + " |"
+Auto-switch rule: when `output_format="table"` is requested but the result is
+a single row with at least one cell exceeding the truncation limit, the
+formatter silently falls back to `vertical` so the AI gets the full value
+instead of a truncated `...`. When any cell in a multi-row table is truncated,
+a note is appended suggesting the AI retry with `vertical` or `json`.
 
-    # Rows
-    row_lines = []
-    for row in rows:
-        cells = []
-        for val in row:
-            if val is None:
-                cells.append("NULL")
-            else:
-                s = str(val)
-                # Escape pipes in values
-                s = s.replace("|", "\\|")
-                # Truncate very long cell values
-                if len(s) > 200:
-                    s = s[:197] + "..."
-                cells.append(s)
-        row_lines.append("| " + " | ".join(cells) + " |")
+Zero-row handling: previously, queries returning zero rows produced the
+misleading "Query returned no columns" message. The formatter now emits an
+empty markdown table with headers plus "*Query returned 0 rows.*", which
+clearly distinguishes "the schema is X and there are no matching rows" from
+an actual empty column set.
 
-    result = "\n".join([header, separator] + row_lines)
+Rendering rules shared across formats:
 
-    if total_count > len(rows):
-        result += f"\n\n*Showing {len(rows)} of {total_count} rows.*"
-
-    return result
-```
+- None/NULL values render as the literal `NULL`
+- In `table`, pipes/newlines are escaped; values >200 chars are truncated
+- In `vertical` and `json`, values are rendered in full
+- JSON non-primitive types (Decimal, datetime, UUID, bytes) are coerced via
+  `_json_safe`; bytes decode as UTF-8 when possible, else hex
 
 ---
 
@@ -807,6 +819,29 @@ Simplicity. This tool has very simple configuration needs (flat env vars with de
 ### Why inject LIMIT via AST manipulation instead of subquery wrapping?
 
 Earlier versions wrapped user queries as `SELECT * FROM ({user_sql}) AS _limited_query LIMIT N`. This breaks `ORDER BY` semantics — PostgreSQL does not guarantee that ordering from an inner subquery propagates to the outer query. The AST-based approach modifies the user's query directly to add/tighten the LIMIT clause, preserving all other semantics including ORDER BY.
+
+### Why reject SHOW / DESCRIBE / EXPLAIN / EXISTS instead of allowing them?
+
+Users of the tool often try raw `SHOW TABLES`, `DESCRIBE t`, or `EXPLAIN ...`
+as SQL via `query_*`. These get parsed by sqlglot as `exp.Command` and
+rejected. The ergonomic fix would be to allow a small whitelist of these
+commands — but at least one of them is a genuine write-bypass vector:
+
+- PostgreSQL's `EXPLAIN ANALYZE` **actually executes** the inner query. An
+  allowlist entry for "EXPLAIN" would accept `EXPLAIN ANALYZE DELETE FROM
+  users` and — without careful inner-query parsing — pass it to the database
+  inside a read-only transaction. The PG-level read-only block would catch
+  the DELETE in this specific case, but we don't want to rely on a single
+  layer when the whole design is defense-in-depth.
+
+- `SHOW`/`DESCRIBE`/`EXISTS` are individually safe, but making the validator
+  command-aware creates maintenance burden (tracking each dialect's command
+  surface) for little benefit, since we already expose dedicated tools for
+  each one.
+
+Instead, the validator produces a pointed error message when it detects one
+of these commands as the root, suggesting the correct dedicated tool. This
+preserves the whitelist security model while closing the discoverability gap.
 
 ### Why asyncpg for PostgreSQL but not an async ClickHouse client?
 

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from readonly_db_mcp.config import Config
 from readonly_db_mcp.server import (
     AppContext,
     _get_backend,
@@ -13,12 +14,16 @@ from readonly_db_mcp.server import (
     list_tables,
     describe_table,
     explain_query,
+    sample_table,
+    usage_guide,
 )
 
 
-def _make_ctx(backends: dict | None = None) -> MagicMock:
+def _make_ctx(backends: dict | None = None, config: Config | None = None) -> MagicMock:
     """Create a mock MCP Context with the given backends."""
-    app = AppContext(backends=backends or {})
+    if config is None:
+        config = Config(postgres_connections=[], clickhouse_connections=[], max_result_rows=1000)
+    app = AppContext(backends=backends or {}, config=config)
     ctx = MagicMock()
     ctx.request_context.lifespan_context = app
     return ctx
@@ -39,6 +44,7 @@ def _make_pg_backend(name: str = "testpg") -> MagicMock:
             {"name": "name", "type": "text", "nullable": "YES"},
         ]
     )
+    backend.table_stats = AsyncMock(return_value=None)  # PG backend returns no stats
     backend.explain = AsyncMock(return_value="Seq Scan on users  (cost=0.00..1.00 rows=1 width=36)")
     return backend
 
@@ -58,6 +64,7 @@ def _make_ch_backend(name: str = "testch") -> MagicMock:
             {"name": "payload", "type": "Nullable(String)", "nullable": "YES"},
         ]
     )
+    backend.table_stats = AsyncMock(return_value=None)  # can be overridden per-test
     backend.explain = AsyncMock(return_value="Expression\n  ReadFromMergeTree")
     return backend
 
@@ -203,3 +210,166 @@ class TestExplainQuery:
         ctx = _make_ctx({"testpg": pg})
         await explain_query("SELECT * FROM users;", "testpg", ctx)
         pg.explain.assert_called_once_with("SELECT * FROM users", analyze=False)
+
+
+class TestDescribeTableWithStats:
+    """describe_table should append backend-provided table metadata when available."""
+
+    async def test_ch_describe_includes_stats(self) -> None:
+        ch = _make_ch_backend()
+        ch.table_stats = AsyncMock(
+            return_value={
+                "engine": "MergeTree",
+                "total_rows": 1000,
+                "total_bytes": 2048,
+                "primary_key": "id",
+                "sorting_key": "id",
+                "partition_key": "",
+            }
+        )
+        ctx = _make_ctx({"testch": ch})
+        result = await describe_table("testch", "events", ctx)
+        assert "| event_id | UInt64 | NO |" in result
+        assert "**Table metadata:**" in result
+        assert "engine: MergeTree" in result
+        assert "total_rows: 1000" in result
+        # Empty partition_key should be suppressed
+        assert "partition_key:" not in result
+
+    async def test_pg_describe_has_no_stats_section(self) -> None:
+        # PG backend returns None from table_stats, so no metadata section
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await describe_table("testpg", "public.users", ctx)
+        assert "Table metadata" not in result
+
+
+class TestSampleTable:
+    """sample_table should issue a validated SELECT * LIMIT n."""
+
+    async def test_sample_basic(self) -> None:
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg}, config=Config(postgres_connections=[], clickhouse_connections=[], max_result_rows=1000))
+        result = await sample_table("testpg", "public.users", ctx, n=5)
+        pg.execute.assert_called_once()
+        sent_sql = pg.execute.call_args[0][0]
+        assert "SELECT * FROM public.users LIMIT 5" == sent_sql
+        assert "| id | name |" in result
+
+    async def test_sample_rejects_unsafe_identifier(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await sample_table("testpg", "users; DROP TABLE x", ctx)
+        assert "Error:" in result
+        assert "Invalid identifier" in result
+
+    async def test_sample_rejects_n_over_max(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()}, config=Config(postgres_connections=[], clickhouse_connections=[], max_result_rows=100))
+        result = await sample_table("testpg", "public.users", ctx, n=5000)
+        assert "Error:" in result
+        assert "MAX_RESULT_ROWS" in result
+
+    async def test_sample_rejects_n_below_one(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await sample_table("testpg", "public.users", ctx, n=0)
+        assert "Error:" in result
+
+    async def test_sample_rejects_invalid_format(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await sample_table("testpg", "public.users", ctx, output_format="xml")
+        assert "Error:" in result
+        assert "output_format" in result
+
+
+class TestUsageGuide:
+    """usage_guide should describe the configured connections and tool surface."""
+
+    async def test_guide_lists_connections_and_tools(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend(), "testch": _make_ch_backend()})
+        result = await usage_guide(ctx)
+        assert "testpg" in result
+        assert "testch" in result
+        # Each major tool name mentioned
+        for tool in ("list_databases", "list_tables", "describe_table", "sample_table",
+                     "query_postgres", "query_clickhouse", "explain_query"):
+            assert tool in result
+        # Documents the three output formats
+        assert "vertical" in result
+        assert "json" in result
+
+
+class TestQueryOutputFormats:
+    """query_* tools should honor the output_format param — tested for both backends
+    to prevent format regressions slipping in via one path but not the other."""
+
+    # ── PostgreSQL ───────────────────────────────────────────────────────
+
+    async def test_pg_json_format(self) -> None:
+        import json as _json
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await query_postgres("SELECT * FROM users", ctx, output_format="json")
+        # JSON output is a strict envelope — always valid JSON, always same shape.
+        data = _json.loads(result)
+        assert data["columns"] == ["id", "name"]
+        assert data["rows"] == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        assert data["truncated"] is False
+
+    async def test_pg_vertical_format(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await query_postgres("SELECT * FROM users", ctx, output_format="vertical")
+        assert "-[ RECORD 1 ]-" in result
+
+    async def test_pg_invalid_format(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await query_postgres("SELECT * FROM users", ctx, output_format="xml")
+        assert "Error:" in result
+
+    # ── ClickHouse (parity) ──────────────────────────────────────────────
+
+    async def test_ch_json_format(self) -> None:
+        import json as _json
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx, output_format="json")
+        data = _json.loads(result)
+        assert data["columns"] == ["count()"]
+        assert data["rows"] == [{"count()": 42}]
+        assert data["truncated"] is False
+
+    async def test_ch_vertical_format(self) -> None:
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx, output_format="vertical")
+        assert "-[ RECORD 1 ]-" in result
+        assert "count() = 42" in result
+
+    async def test_ch_invalid_format(self) -> None:
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT 1", ctx, output_format="xml")
+        assert "Error:" in result
+        assert "output_format" in result
+
+    async def test_ch_table_format_default(self) -> None:
+        """Default format is markdown table for ClickHouse too."""
+        ctx = _make_ctx({"testch": _make_ch_backend()})
+        result = await query_clickhouse("SELECT count() FROM events", ctx)
+        assert "| count() |" in result
+        assert "| 42 |" in result
+
+
+class TestErrorForwarding:
+    """query_* tools should forward the DB driver's error message, no stack traces."""
+
+    async def test_forwards_error_message(self) -> None:
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(side_effect=RuntimeError('relation "foo" does not exist'))
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT * FROM foo", ctx)
+        assert "relation \"foo\" does not exist" in result
+        # Never a traceback
+        assert "Traceback" not in result
+
+    async def test_error_message_capped(self) -> None:
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(side_effect=RuntimeError("x" * 2000))
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT 1", ctx)
+        # Message truncated at 500 chars
+        assert "x" * 600 not in result
+        assert "..." in result
