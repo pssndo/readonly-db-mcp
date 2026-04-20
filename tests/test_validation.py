@@ -192,3 +192,39 @@ class TestBlockedQueries:
         the validator doesn't silently pass due to dialect-specific parsing differences."""
         with pytest.raises(ValueError):
             validate_read_only("SELECT * INTO new_table FROM users", dialect="clickhouse")
+
+
+class TestErgonomicHints:
+    """When a common read-intent command is rejected, point the user at the dedicated tool.
+    These MUST still raise — the hint only improves the error message. It never
+    accepts the query."""
+
+    def test_show_tables_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="list_tables"):
+            validate_read_only("SHOW TABLES", dialect="clickhouse")
+
+    def test_show_databases_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="list_tables"):
+            validate_read_only("SHOW DATABASES", dialect="clickhouse")
+
+    def test_describe_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="describe_table"):
+            validate_read_only("DESCRIBE events", dialect="clickhouse")
+
+    def test_desc_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="describe_table"):
+            validate_read_only("DESC events", dialect="clickhouse")
+
+    def test_exists_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="list_tables|describe_table"):
+            validate_read_only("EXISTS TABLE events", dialect="clickhouse")
+
+    def test_explain_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="explain_query"):
+            validate_read_only("EXPLAIN SELECT 1", dialect="postgres")
+
+    def test_explain_analyze_delete_still_rejected(self) -> None:
+        """Critical: EXPLAIN ANALYZE DELETE actually executes the DELETE in PostgreSQL.
+        The validator MUST reject this — the hint path is only for error messaging."""
+        with pytest.raises(ValueError):
+            validate_read_only("EXPLAIN ANALYZE DELETE FROM users", dialect="postgres")

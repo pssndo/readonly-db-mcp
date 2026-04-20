@@ -258,6 +258,60 @@ class ClickHouseBackend(DatabaseBackend):
             for r in result.result_rows
         ]
 
+    async def table_stats(self, table: str) -> dict | None:
+        """Return engine, row count, size, and key metadata from system.tables.
+
+        Accepts "db.table" (fully qualified) or just "table" (resolved against
+        the configured default database). Returns None if the table is not
+        found in system.tables — this is not an error (the user may not have
+        SELECT on system.tables, or the table may live in a schema outside
+        our default).
+
+        Safety: the query uses parameterized values ($1/$2) via clickhouse-connect's
+        parameter binding to prevent SQL injection in the schema/table values.
+        We still call validate_identifier() as defense-in-depth.
+        """
+        client = self._ensure_connected()
+        if "." in table:
+            db, tbl = table.split(".", 1)
+        else:
+            db, tbl = self.database, table
+        validate_identifier(db)
+        validate_identifier(tbl)
+
+        # clickhouse-connect supports positional %s-style parameters. Values
+        # are server-side bound, so SQL injection via db/tbl is not possible.
+        sql = (
+            "SELECT engine, total_rows, total_bytes, primary_key, "
+            "sorting_key, partition_key "
+            "FROM system.tables "
+            "WHERE database = {db:String} AND name = {tbl:String}"
+        )
+        try:
+            result = await asyncio.to_thread(
+                client.query,
+                sql,
+                parameters={"db": db, "tbl": tbl},
+            )
+        except Exception as e:
+            # If the user lacks SELECT on system.tables, or any other error,
+            # fall back to no stats rather than failing the whole describe_table.
+            logger.info("table_stats query failed for '%s.%s': %s", db, tbl, e)
+            return None
+
+        rows = result.result_rows
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "engine": r[0],
+            "total_rows": r[1],
+            "total_bytes": r[2],
+            "primary_key": r[3],
+            "sorting_key": r[4],
+            "partition_key": r[5],
+        }
+
     async def explain(self, sql: str, analyze: bool = False) -> str:
         """Return the EXPLAIN output for a query.
 

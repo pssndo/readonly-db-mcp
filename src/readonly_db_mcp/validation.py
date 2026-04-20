@@ -86,6 +86,13 @@ def validate_read_only(sql: str, dialect: str) -> str:
     try:
         statements = parse(sql_stripped, dialect=dialect)
     except ParseError as e:
+        # Some dialect-specific commands (e.g. ClickHouse's `EXISTS TABLE x`)
+        # don't parse cleanly. If the first word is a common read-intent
+        # command, show the pointed error instead of the raw parse error —
+        # the user's intent is clear even if sqlglot can't parse it.
+        hint = _ergonomic_hint_for_rejected(sql_stripped)
+        if hint:
+            raise ValueError(hint)
         raise ValueError(f"SQL parse error: {e}")
 
     if not statements:
@@ -103,6 +110,14 @@ def validate_read_only(sql: str, dialect: str) -> str:
     # This is the first line of defense. If someone sends "DROP TABLE users",
     # the root AST node will be a Drop, which is not in ALLOWED_ROOT_TYPES.
     if not isinstance(ast, ALLOWED_ROOT_TYPES):
+        # Detect common read-intent commands (SHOW, DESCRIBE, EXISTS, EXPLAIN)
+        # that users often try via raw SQL, and point them at the dedicated
+        # tools. We still reject — allowing raw EXPLAIN would be a bypass risk
+        # (e.g. PostgreSQL's EXPLAIN ANALYZE actually executes the inner query,
+        # so EXPLAIN ANALYZE DELETE FROM users would wipe the table).
+        hint = _ergonomic_hint_for_rejected(sql_stripped)
+        if hint:
+            raise ValueError(hint)
         raise ValueError(f"Only SELECT queries are allowed. Got: {type(ast).__name__}")
 
     # ── Check 2: Walk the full tree looking for forbidden nodes ──────────
@@ -115,3 +130,42 @@ def validate_read_only(sql: str, dialect: str) -> str:
     # Return the cleaned SQL (stripped of whitespace and trailing semicolons)
     # so callers can use it directly for execution without re-parsing.
     return sql_stripped
+
+
+def _ergonomic_hint_for_rejected(sql: str) -> str | None:
+    """Return a tool-pointing error message when the user tried a common read-intent
+    command via raw SQL (SHOW, DESCRIBE, EXISTS, EXPLAIN). Returns None if no
+    match — caller falls back to the generic rejection message.
+
+    IMPORTANT: This function NEVER relaxes validation. It only improves the
+    error message shown to the user when their query is rejected. All branches
+    must raise (via the caller) — never return an "approved" status.
+    """
+    # Check the raw SQL prefix (sqlglot's exp.Command wraps these with varying
+    # internal representations across dialects, and some dialect-specific
+    # commands like ClickHouse's `EXISTS TABLE x` fail to parse at all —
+    # checking the text is the most reliable signal).
+    first_word = sql.strip().split(None, 1)[0].upper() if sql.strip() else ""
+
+    if first_word in ("SHOW",):
+        return (
+            "SHOW commands are not allowed as raw SQL. Use the `list_tables` tool "
+            "to list tables, or `list_databases` to see configured connections."
+        )
+    if first_word in ("DESCRIBE", "DESC"):
+        return (
+            "DESCRIBE is not allowed as raw SQL. Use the `describe_table` tool "
+            "to get columns, types, and nullability."
+        )
+    if first_word == "EXISTS":
+        return (
+            "EXISTS table-check is not allowed as raw SQL. Use `list_tables` to "
+            "see what exists, or `describe_table` which errors if the table is missing."
+        )
+    if first_word == "EXPLAIN":
+        return (
+            "EXPLAIN is not allowed as raw SQL (EXPLAIN ANALYZE can execute the "
+            "inner query, which is a write-bypass risk). Use the `explain_query` "
+            "tool instead — it validates the inner query is read-only first."
+        )
+    return None
