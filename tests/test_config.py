@@ -38,7 +38,46 @@ class TestLoadConfig:
         assert len(config.clickhouse_connections) == 1
         assert config.clickhouse_connections[0].name == "analytics"
         assert config.clickhouse_connections[0].port == 8123
+        # secure defaults to False when CH_N_SECURE is not set
+        assert config.clickhouse_connections[0].secure is False
         assert len(config.postgres_connections) == 0
+
+    def test_clickhouse_secure_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CH_1_SECURE=true enables TLS — required for ClickHouse Cloud."""
+        monkeypatch.setenv("CH_1_NAME", "cloud")
+        monkeypatch.setenv("CH_1_HOST", "abc.europe-west4.gcp.clickhouse.cloud")
+        monkeypatch.setenv("CH_1_PORT", "8443")
+        monkeypatch.setenv("CH_1_DATABASE", "default")
+        monkeypatch.setenv("CH_1_USER", "reader")
+        monkeypatch.setenv("CH_1_PASSWORD", "secret")
+        monkeypatch.setenv("CH_1_SECURE", "true")
+
+        config = load_config()
+        assert config.clickhouse_connections[0].secure is True
+
+    def test_clickhouse_secure_accepts_variants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CH_N_SECURE accepts true/1/yes/on (case-insensitive)."""
+        for value in ("true", "TRUE", "1", "yes", "YES", "on"):
+            monkeypatch.setenv("CH_1_NAME", "ch")
+            monkeypatch.setenv("CH_1_HOST", "h")
+            monkeypatch.setenv("CH_1_DATABASE", "d")
+            monkeypatch.setenv("CH_1_USER", "u")
+            monkeypatch.setenv("CH_1_PASSWORD", "p")
+            monkeypatch.setenv("CH_1_SECURE", value)
+            config = load_config()
+            assert config.clickhouse_connections[0].secure is True, f"Expected True for {value!r}"
+
+    def test_clickhouse_secure_falsy_variants(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CH_N_SECURE treats false/0/no/off/empty as False."""
+        for value in ("false", "FALSE", "0", "no", "off", ""):
+            monkeypatch.setenv("CH_1_NAME", "ch")
+            monkeypatch.setenv("CH_1_HOST", "h")
+            monkeypatch.setenv("CH_1_DATABASE", "d")
+            monkeypatch.setenv("CH_1_USER", "u")
+            monkeypatch.setenv("CH_1_PASSWORD", "p")
+            monkeypatch.setenv("CH_1_SECURE", value)
+            config = load_config()
+            assert config.clickhouse_connections[0].secure is False, f"Expected False for {value!r}"
 
     def test_multiple_postgres(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for i in (1, 2):
@@ -79,7 +118,7 @@ class TestLoadConfig:
         # and doesn't stop at gaps — PG_50_NAME would still be found.
         for prefix in ("PG_", "CH_"):
             for i in range(1, 101):
-                for suffix in ("NAME", "HOST", "PORT", "DATABASE", "USER", "PASSWORD"):
+                for suffix in ("NAME", "HOST", "PORT", "DATABASE", "USER", "PASSWORD", "SECURE"):
                     monkeypatch.delenv(f"{prefix}{i}_{suffix}", raising=False)
         with pytest.raises(ValueError, match="No database connections configured"):
             load_config()

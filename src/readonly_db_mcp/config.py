@@ -21,6 +21,9 @@ How it works:
 
     Optional env vars per connection:
         *_PORT      - Port number (defaults: 5432 for PG, 8123 for CH)
+        *_SECURE    - ClickHouse only: "true"/"1" to use HTTPS/TLS (default: false).
+                      Required for ClickHouse Cloud, which listens on port 8443
+                      with TLS. Ignored for PostgreSQL.
 
     Global settings:
         QUERY_TIMEOUT_SECONDS  - Max seconds per query (default: 30)
@@ -61,10 +64,11 @@ class ClickHouseConnection:
 
     name: str  # Friendly name (CH_N_NAME), used to identify this connection in tools
     host: str  # Server hostname (CH_N_HOST)
-    port: int  # HTTP interface port (CH_N_PORT, default 8123)
+    port: int  # HTTP interface port (CH_N_PORT, default 8123; typically 8443 for TLS)
     database: str  # Database name to connect to (CH_N_DATABASE)
     user: str  # Auth username (CH_N_USER) — should be a read-only DB user
     password: str  # Auth password (CH_N_PASSWORD)
+    secure: bool = False  # Use HTTPS/TLS (CH_N_SECURE, default False). Required for ClickHouse Cloud.
 
 
 @dataclass
@@ -75,6 +79,17 @@ class Config:
     clickhouse_connections: list[ClickHouseConnection]  # All configured CH connections
     query_timeout_seconds: int = 30  # Max seconds before a query is killed
     max_result_rows: int = 1000  # Max rows returned to the AI (rest are truncated)
+
+
+def _parse_bool(raw: str | None, *, default: bool = False) -> bool:
+    """Parse a truthy string from env vars. Accepts common variants (case-insensitive).
+
+    Truthy: "true", "1", "yes", "on"
+    Falsy:  "false", "0", "no", "off", "" (empty)
+    """
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"true", "1", "yes", "on"}
 
 
 def _require_env(key: str, context: str) -> str:
@@ -147,7 +162,7 @@ def load_config() -> Config:
         {
             int(m.group(1))
             for k in os.environ
-            if (m := re.match(r"^CH_(\d+)_(NAME|HOST|PORT|DATABASE|USER|PASSWORD)$", k))
+            if (m := re.match(r"^CH_(\d+)_(NAME|HOST|PORT|DATABASE|USER|PASSWORD|SECURE)$", k))
         }
     )
     ch_conns: list[ClickHouseConnection] = []
@@ -161,6 +176,7 @@ def load_config() -> Config:
                 database=_require_env(f"CH_{i}_DATABASE", context),
                 user=_require_env(f"CH_{i}_USER", context),
                 password=_require_env(f"CH_{i}_PASSWORD", context),
+                secure=_parse_bool(os.environ.get(f"CH_{i}_SECURE"), default=False),
             )
         )
 

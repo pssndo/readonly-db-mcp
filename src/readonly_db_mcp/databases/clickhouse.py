@@ -1,10 +1,18 @@
 """
-ClickHouse backend using clickhouse-connect with readonly=1 enforcement.
+ClickHouse backend using clickhouse-connect.
 
-This is the second layer of write protection (after SQL validation):
-    - The client is created with `settings={"readonly": "1"}`, which tells
-      ClickHouse to reject any write operation at the session level.
-    - Every query also passes `readonly=1` at the query level as extra safety.
+Read-only enforcement depends on the DB user having a read-only profile/role
+on the server side (e.g. SETTINGS PROFILE 'readonly' or GRANT SELECT only).
+This is verified at the server, which is the strongest guarantee.
+
+We do NOT pass settings={"readonly": "1"} via clickhouse-connect — newer
+versions (>=0.8) validate setting names against the server, and a client
+that already has the readonly profile cannot re-set it, which causes a
+ProgrammingError at client creation and on every query. The defense layers
+that remain:
+    - sqlglot AST validation (rejects non-SELECT before sending to the server)
+    - DB user GRANT/profile (the server enforces it)
+    - max_execution_time is still passed per-query to prevent runaway queries.
 
 Key concepts for non-Python readers:
     - `clickhouse-connect` is the official ClickHouse Python client.
@@ -71,6 +79,7 @@ class ClickHouseBackend(DatabaseBackend):
         self.user = conn_config.user
         self.password = conn_config.password
         self.name = conn_config.name
+        self.secure = conn_config.secure  # HTTPS/TLS — required for ClickHouse Cloud
         self._client: Client | None = None  # Set by connect(), None until then
         self._timeout = app_config.query_timeout_seconds if app_config else 30
         self._max_rows = app_config.max_result_rows if app_config else 1000
@@ -99,7 +108,15 @@ class ClickHouseBackend(DatabaseBackend):
             username=self.user,
             password=self.password,
             database=self.database,
-            settings={"readonly": "1"},  # Layer 2: CH-level read-only
+            secure=self.secure,  # Use HTTPS/TLS if configured (e.g. ClickHouse Cloud on port 8443)
+            # NOTE: We intentionally do NOT pass settings={"readonly": "1"} here.
+            # clickhouse-connect >=0.8 validates setting names against the server,
+            # and "readonly" is itself a read-only setting that cannot be changed
+            # by a client that already has a readonly profile. The DB user MUST
+            # have GRANT SELECT only (enforced at the server via profile/role),
+            # which is the primary defense. Additional defenses:
+            #   - sqlglot AST validation rejects non-SELECT before queries are sent
+            #   - max_execution_time is still passed per-query via settings
         )
 
     async def _reconnect(self) -> Client:
@@ -182,11 +199,13 @@ class ClickHouseBackend(DatabaseBackend):
         limited_sql = inject_limit(sql, fetch_limit, dialect="clickhouse")
 
         # Try the query. If it fails with a connection error, retry once with reconnect.
+        # Note: "readonly" is NOT in settings — see _create_client() for why.
+        # max_execution_time kills the query server-side if it runs too long.
         try:
             result = await asyncio.to_thread(
                 client.query,
                 limited_sql,
-                settings={"readonly": "1", "max_execution_time": self._timeout},
+                settings={"max_execution_time": self._timeout},
             )
         except Exception as e:
             # If we detect a likely stale/broken connection, retry once with a
@@ -197,7 +216,7 @@ class ClickHouseBackend(DatabaseBackend):
                 result = await asyncio.to_thread(
                     client.query,
                     limited_sql,
-                    settings={"readonly": "1", "max_execution_time": self._timeout},
+                    settings={"max_execution_time": self._timeout},
                 )
             else:
                 # Not a connection error — just re-raise
@@ -216,11 +235,7 @@ class ClickHouseBackend(DatabaseBackend):
         in the current database. Each row has a single column with the table name.
         """
         client = self._ensure_connected()
-        result = await asyncio.to_thread(
-            client.query,
-            "SHOW TABLES",
-            settings={"readonly": "1"},
-        )
+        result = await asyncio.to_thread(client.query, "SHOW TABLES")
         # result.result_rows is a list of tuples; each tuple has one element (table name)
         return [r[0] for r in result.result_rows]
 
@@ -234,11 +249,7 @@ class ClickHouseBackend(DatabaseBackend):
         """
         client = self._ensure_connected()
         safe_table = validate_identifier(table)  # Prevent SQL injection
-        result = await asyncio.to_thread(
-            client.query,
-            f"DESCRIBE TABLE {safe_table}",
-            settings={"readonly": "1"},
-        )
+        result = await asyncio.to_thread(client.query, f"DESCRIBE TABLE {safe_table}")
         # DESCRIBE TABLE returns rows like: (name, type, default_type, default_expression, ...)
         # We only need the first two columns (name, type). ClickHouse marks nullable
         # columns with Nullable(Type) wrapper, so we check for that prefix.
@@ -262,11 +273,7 @@ class ClickHouseBackend(DatabaseBackend):
         """
         client = self._ensure_connected()
         explain_sql = f"EXPLAIN {sql}"
-        result = await asyncio.to_thread(
-            client.query,
-            explain_sql,
-            settings={"readonly": "1"},
-        )
+        result = await asyncio.to_thread(client.query, explain_sql)
         # Each row has a single column with one line of the explain output
         plan = "\n".join(str(r[0]) for r in result.result_rows)
 
