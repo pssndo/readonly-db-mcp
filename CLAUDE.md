@@ -2,7 +2,7 @@
 
 ## Project
 
-`readonly-db-mcp` — a pip-installable MCP server that gives AI agents read-only SQL access to PostgreSQL, ClickHouse, MySQL, and MariaDB. Three layers of write protection: sqlglot AST validation, connection-level read-only enforcement, and DB user permissions.
+`readonly-db-mcp` — a pip-installable MCP server that gives AI agents read-only SQL access to PostgreSQL, ClickHouse, MySQL, MariaDB, and SQLite. Three layers of write protection: sqlglot AST validation, connection-level read-only enforcement, and DB user permissions (or filesystem permissions for SQLite).
 
 ## Architecture
 
@@ -12,8 +12,8 @@ See `ARCHITECTURE.md` for the full system design, reference implementations, val
 
 - Python >=3.11
 - `mcp` (FastMCP) for the MCP server
-- `sqlglot` for SQL parsing/validation (dialects: `postgres`, `clickhouse`, `mysql` — MariaDB uses the mysql dialect)
-- `asyncpg` for PostgreSQL, `clickhouse-connect` for ClickHouse, `asyncmy` for MySQL + MariaDB
+- `sqlglot` for SQL parsing/validation (dialects: `postgres`, `clickhouse`, `mysql`, `sqlite` — MariaDB uses the mysql dialect)
+- `asyncpg` for PostgreSQL, `clickhouse-connect` for ClickHouse, `asyncmy` for MySQL + MariaDB, stdlib `sqlite3` for SQLite
 - `python-dotenv` for .env file loading
 - `pytest` + `pytest-asyncio` for tests
 
@@ -23,7 +23,7 @@ See `ARCHITECTURE.md` for the full system design, reference implementations, val
 src/readonly_db_mcp/
   __init__.py
   server.py          # FastMCP server, tool definitions, lifespan
-  config.py          # Env var parsing (PG_1_*, CH_1_*, MYSQL_1_*, MARIADB_1_*)
+  config.py          # Env var parsing (PG_1_*, CH_1_*, MYSQL_1_*, MARIADB_1_*, SQLITE_1_*)
   validation.py      # sqlglot read-only validator (whitelist, not blacklist)
   formatting.py      # Results -> markdown tables / vertical / json envelope
   databases/
@@ -34,6 +34,9 @@ src/readonly_db_mcp/
                      # MySQLBackend + MariaDBBackend share a _MySQLFamilyBackend
                      # base; each subclass sets its own class-level db_type.
                      # Subclass db_type drives timeout-SQL selection at runtime.
+    sqlite.py        # stdlib sqlite3 wrapped in asyncio.to_thread
+                     # VFS-level read-only open (file:?mode=ro)
+                     # Extension loading disabled at connect time
 tests/
   test_validation.py # SQL validation tests (security-critical)
   test_config.py
@@ -56,9 +59,11 @@ readonly-db-mcp                # Run the server (needs env vars)
 ## Key rules
 
 - The SQL validator uses a **whitelist** approach: root AST node must be SELECT/UNION/INTERSECT/EXCEPT. Everything else is rejected. The full AST is walked to catch writes hidden in CTEs or subqueries.
-- `clickhouse-connect` is synchronous — always wrap calls in `asyncio.to_thread()`. `asyncpg` and `asyncmy` are native-async.
+- `clickhouse-connect` and stdlib `sqlite3` are synchronous — always wrap calls in `asyncio.to_thread()`. `asyncpg` and `asyncmy` are native-async.
 - MySQL/MariaDB Layer 2: set `SET SESSION TRANSACTION READ ONLY` via asyncmy's `init_command`, and wrap every query in `START TRANSACTION READ ONLY` / `COMMIT`. No per-connection server-enforced flag like PG — the explicit per-query transaction is doing the real work.
 - MySQL 8.0.18+ `EXPLAIN ANALYZE` and MariaDB's `ANALYZE <stmt>` both **execute** the inner query. The MySQL backend's `explain()` always runs plain `EXPLAIN` (plan-only) regardless of the `analyze` flag; add a note to the output if `analyze=True` was requested.
+- SQLite Layer 2 is `file:<path>?mode=ro` + `enable_load_extension(False)`. VFS read-only does NOT block `ATTACH DATABASE` — the sqlglot validator (Layer 1) is the only defense against ATTACH, so the validator-level rejection must not be relaxed. `EXPLAIN QUERY PLAN` is strictly plan-only on SQLite (unlike PG/MySQL's `EXPLAIN ANALYZE`).
+- SQLite has no GRANT — authorization is filesystem-level. The operator controls reachable paths via `SQLITE_N_PATH` env vars. Documented in README.md's DB user setup section.
 - Never return stack traces to the AI agent. Catch exceptions and return clear one-line error messages (with forwarded driver detail via `_safe_error_message`).
 - Results are formatted as markdown tables (default), vertical key=value rows, or strict JSON envelope. Truncate to `MAX_RESULT_ROWS` and note when truncated.
 - The server runs on stdio transport only (what Claude Code uses).

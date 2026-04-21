@@ -1,6 +1,6 @@
 # readonly-db-mcp
 
-Read-only MCP server for PostgreSQL, ClickHouse, MySQL, and MariaDB — safe database access for AI agents.
+Read-only MCP server for PostgreSQL, ClickHouse, MySQL, MariaDB, and SQLite — safe database access for AI agents.
 
 ## What is this?
 
@@ -27,6 +27,9 @@ AI Agent sends SQL
        |   ClickHouse:     readonly = 1
        |   MySQL/MariaDB:  SET SESSION TRANSACTION READ ONLY (at connect)
        |                   + START TRANSACTION READ ONLY per query
+       |   SQLite:         file:<path>?mode=ro (VFS-level read-only)
+       |                   + enable_load_extension(False) to block the
+       |                   SELECT load_extension(...) bypass
        |   Even if Layer 1 has a bug, the database itself rejects writes.
        |
        v
@@ -40,7 +43,7 @@ AI Agent sends SQL
 
 **Why three layers?** Each layer alone has known bypasses:
 - Layer 1 (SQL parsing) can't detect side effects in stored procedures
-- Layer 2 (PG `default_transaction_read_only`, MySQL/MariaDB `SESSION TRANSACTION READ ONLY`) can be overridden by `SET` (which Layer 1 blocks). For MySQL/MariaDB Layer 2 is also slightly weaker than PG's because there's no server-enforced pool-level flag — we compensate by wrapping every query in `START TRANSACTION READ ONLY` explicitly.
+- Layer 2 (PG `default_transaction_read_only`, MySQL/MariaDB `SESSION TRANSACTION READ ONLY`, SQLite `file:?mode=ro`) can be overridden by `SET` / `PRAGMA` statements (which Layer 1 blocks). For MySQL/MariaDB Layer 2 is also slightly weaker than PG's because there's no server-enforced pool-level flag — we compensate by wrapping every query in `START TRANSACTION READ ONLY` explicitly. For SQLite, VFS read-only is strong for the main database but doesn't block `ATTACH DATABASE` (attached DBs are also read-only, but widen the reachable-path set) — Layer 1 rejects `ATTACH` at parse time.
 - Layer 3 (DB user privileges) depends on the operator configuring it correctly
 
 Together, they provide defense in depth.
@@ -73,6 +76,7 @@ src/readonly_db_mcp/
     postgres.py        # PostgreSQL backend (asyncpg, connection pool, read-only txns)
     clickhouse.py      # ClickHouse backend (clickhouse-connect, readonly=1)
     mysql.py           # MySQL + MariaDB backend (asyncmy pool, SESSION READ ONLY + START TRANSACTION READ ONLY)
+    sqlite.py          # SQLite backend (stdlib sqlite3 + asyncio.to_thread; VFS-level read-only URI; extension loading disabled)
 tests/
   test_validation.py   # SQL validation tests (the critical security tests)
   test_config.py       # Config parsing tests
@@ -157,6 +161,14 @@ MARIADB_1_DATABASE=legacy_app
 MARIADB_1_USER=ai_reader
 MARIADB_1_PASSWORD=secret
 
+# SQLite connections (SQLITE_1_, SQLITE_2_, etc.)
+# SQLite is a single-file database — no host, port, user, or password.
+# The operator controls which paths are reachable (treat it like GRANT SELECT
+# on server-based backends). The connection is opened read-only at the VFS
+# layer (file:<path>?mode=ro).
+SQLITE_1_NAME=local_dev
+SQLITE_1_PATH=/var/data/app.db
+
 # Global settings (optional)
 QUERY_TIMEOUT_SECONDS=30        # Max seconds per query (default: 30)
 MAX_RESULT_ROWS=1000            # Max rows returned (default: 1000, rest truncated)
@@ -198,7 +210,7 @@ Claude Code auto-discovers the tools. No further setup needed.
 
 ## MCP tools
 
-Ten tools are exposed to the AI agent:
+Eleven tools are exposed to the AI agent:
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -206,8 +218,9 @@ Ten tools are exposed to the AI agent:
 | `query_clickhouse` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against ClickHouse |
 | `query_mysql` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MySQL |
 | `query_mariadb` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MariaDB |
+| `query_sqlite` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against a SQLite file (opened VFS-level read-only) |
 | `list_databases` | (none) | List all configured database connections |
-| `list_tables` | `database`, `schema?` | List all tables in a database (optionally scoped to a specific schema) |
+| `list_tables` | `database`, `schema?` | List all tables in a database (optionally scoped to a specific schema; SQLite has no schemas) |
 | `describe_table` | `database`, `table` | Columns, types, nullability (+ engine/rows/keys for CH and MySQL/MariaDB) |
 | `sample_table` | `database`, `table`, `n?`, `output_format?` | First N rows of a table (validated `SELECT * LIMIT n`) |
 | `explain_query` | `sql`, `database`, `analyze?` | Show the query execution plan |
@@ -255,6 +268,19 @@ GRANT SELECT ON legacy_app.* TO 'ai_reader'@'%';
 ```
 
 Same privilege posture as MySQL.
+
+### SQLite
+
+SQLite has no GRANT statement — authorization is filesystem-level. Run the MCP server under a dedicated OS user whose read-only file permissions gate access:
+
+```bash
+# Example: give ai_reader read-only access to the app DB
+sudo chown root:ai_reader /var/data/app.db
+sudo chmod 640 /var/data/app.db     # rw- for root, r-- for ai_reader group
+sudo chmod 755 /var/data             # traversable directory
+```
+
+Then run the MCP server as the `ai_reader` user. The server also opens SQLite via the `file:<path>?mode=ro` URI, so writes would be rejected even if filesystem permissions were wrong — but treat the filesystem ACL as the primary privilege boundary, same as `GRANT SELECT` on other backends.
 
 ## Known limitations
 

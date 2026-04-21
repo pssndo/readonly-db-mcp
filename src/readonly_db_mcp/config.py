@@ -33,6 +33,8 @@ How it works:
         MARIADB_N_*  - MariaDB (separate prefix from MySQL; same wire protocol
                        but distinct at the config layer so operators can be
                        explicit about what they're talking to)
+        SQLITE_N_*   - SQLite (only *_NAME and *_PATH — no host/port/user;
+                       SQLite is a single file, not a server)
 
     Global settings:
         QUERY_TIMEOUT_SECONDS  - Max seconds per query (default: 30)
@@ -115,6 +117,20 @@ class MariaDBConnection:
 
 
 @dataclass
+class SqliteConnection:
+    """Configuration for a single SQLite connection.
+
+    SQLite is a single-file database, so there's no host/port/user/password.
+    Just a friendly name and an absolute filesystem path. The operator
+    controls which files are reachable — the same trust boundary as GRANT
+    SELECT ONLY on server-based backends.
+    """
+
+    name: str  # Friendly name (SQLITE_N_NAME)
+    path: str  # Filesystem path to the .db file (SQLITE_N_PATH)
+
+
+@dataclass
 class Config:
     """Application configuration with all database connections and global settings."""
 
@@ -122,6 +138,7 @@ class Config:
     clickhouse_connections: list[ClickHouseConnection]  # All configured CH connections
     mysql_connections: list[MysqlConnection] = field(default_factory=list)  # All configured MySQL connections
     mariadb_connections: list[MariaDBConnection] = field(default_factory=list)  # All configured MariaDB connections
+    sqlite_connections: list[SqliteConnection] = field(default_factory=list)  # All configured SQLite connections
     query_timeout_seconds: int = 30  # Max seconds before a query is killed
     max_result_rows: int = 1000  # Max rows returned to the AI (rest are truncated)
 
@@ -299,11 +316,31 @@ def load_config() -> Config:
             )
         )
 
+    # ── Scan for SQLite connections ──────────────────────────────────────
+    # SQLite needs only NAME + PATH (no host/port/user/password — it's a file).
+    sqlite_ids = sorted(
+        {
+            int(m.group(1))
+            for k in os.environ
+            if (m := re.match(r"^SQLITE_(\d+)_(NAME|PATH)$", k))
+        }
+    )
+    sqlite_conns: list[SqliteConnection] = []
+    for i in sqlite_ids:
+        context = f"SQLITE_{i}"
+        sqlite_conns.append(
+            SqliteConnection(
+                name=_require_env(f"SQLITE_{i}_NAME", context),
+                path=_require_env(f"SQLITE_{i}_PATH", context),
+            )
+        )
+
     # At least one database must be configured, otherwise the server is useless
-    if not pg_conns and not ch_conns and not mysql_conns and not mariadb_conns:
+    if not pg_conns and not ch_conns and not mysql_conns and not mariadb_conns and not sqlite_conns:
         raise ValueError(
-            "No database connections configured. "
-            "Set PG_1_NAME/..., CH_1_NAME/..., MYSQL_1_NAME/..., or MARIADB_1_NAME/... environment variables."
+            "No database connections configured. Set PG_1_NAME/..., CH_1_NAME/..., "
+            "MYSQL_1_NAME/..., MARIADB_1_NAME/..., or SQLITE_1_NAME/SQLITE_1_PATH "
+            "environment variables."
         )
 
     # Parse global settings with basic bounds validation
@@ -320,6 +357,7 @@ def load_config() -> Config:
         clickhouse_connections=ch_conns,
         mysql_connections=mysql_conns,
         mariadb_connections=mariadb_conns,
+        sqlite_connections=sqlite_conns,
         query_timeout_seconds=query_timeout,
         max_result_rows=max_rows,
     )

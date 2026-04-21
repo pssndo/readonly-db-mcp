@@ -1,6 +1,6 @@
 # readonly-db-mcp Architecture
 
-This document describes the architecture, design decisions, and implementation details of readonly-db-mcp — a production-grade MCP server that provides safe, read-only SQL access to PostgreSQL, ClickHouse, MySQL, and MariaDB databases for AI agents.
+This document describes the architecture, design decisions, and implementation details of readonly-db-mcp — a production-grade MCP server that provides safe, read-only SQL access to PostgreSQL, ClickHouse, MySQL, MariaDB, and SQLite databases for AI agents.
 
 **For user-facing documentation**, see [README.md](README.md).
 
@@ -8,7 +8,7 @@ This document describes the architecture, design decisions, and implementation d
 
 ## Overview
 
-readonly-db-mcp is a pip-installable MCP server that gives AI agents (Claude Code, Cursor, etc.) safe, **read-only** SQL access to PostgreSQL, ClickHouse, MySQL, and MariaDB databases. Three independent layers of write protection ensure that even a compromised or malicious AI agent cannot modify production data.
+readonly-db-mcp is a pip-installable MCP server that gives AI agents (Claude Code, Cursor, etc.) safe, **read-only** SQL access to PostgreSQL, ClickHouse, MySQL, MariaDB, and SQLite databases. Three independent layers of write protection ensure that even a compromised or malicious AI agent cannot modify production data.
 
 **Design priorities:**
 - **Security first**: Three-layer defense-in-depth architecture
@@ -31,22 +31,25 @@ Claude Code / AI Agent
 |  1. sqlglot validation    |  <-- parse SQL AST, reject non-SELECT
 |  2. connection pool       |  <-- asyncpg (PG) / clickhouse-connect (CH)
 |                           |      asyncmy (MySQL + MariaDB)
+|                           |      stdlib sqlite3 (SQLite, file-based)
 |  3. read-only transaction |  <-- belt-and-suspenders enforcement
 |  4. result formatting     |  <-- markdown tables for the AI
 +---------------------------+
         |
-        | SQL (read-only user)
+        | SQL (read-only user, or VFS-level read-only for SQLite)
         v
-  PostgreSQL    ClickHouse    MySQL    MariaDB
+  PostgreSQL    ClickHouse    MySQL    MariaDB    SQLite
 ```
 
 ### Three Layers of Write Protection
 
 1. **sqlglot AST validation** -- whitelist approach: root node must be SELECT-family, full tree walk rejects any write node hidden in CTEs/subqueries
-2. **Connection-level settings** -- `default_transaction_read_only=on` (PG), `readonly=1` (CH), `SET SESSION TRANSACTION READ ONLY` + per-query `START TRANSACTION READ ONLY` (MySQL/MariaDB)
-3. **DB user permissions** -- dedicated users with only `GRANT SELECT` (set up by the operator, not this tool)
+2. **Connection-level settings** -- `default_transaction_read_only=on` (PG), `readonly=1` (CH), `SET SESSION TRANSACTION READ ONLY` + per-query `START TRANSACTION READ ONLY` (MySQL/MariaDB), `file:?mode=ro` URI + `enable_load_extension(False)` (SQLite)
+3. **DB user permissions** -- dedicated users with only `GRANT SELECT` (PG/CH/MySQL/MariaDB); for SQLite, the operator controls which `.db` file paths are reachable via `SQLITE_N_PATH` env vars
 
 **MySQL/MariaDB caveat for Layer 2:** unlike PostgreSQL, MySQL and MariaDB have no server-side per-connection "default transaction read-only" flag. We approximate it by running `SET SESSION TRANSACTION READ ONLY` at connection init (via asyncmy's `init_command`) and wrapping every query in `START TRANSACTION READ ONLY` / `COMMIT`. This is slightly weaker than the PG mechanism because a hypothetical query that bypassed our transaction wrapping could toggle the session back to READ WRITE — but Layer 1 (sqlglot) rejects `SET` statements at parse time, so this gap only matters if Layer 1 were already compromised. **Layer 3 (GRANT SELECT only) is the authoritative backstop for MySQL/MariaDB** and must not be skipped.
+
+**SQLite caveat for Layer 2:** the VFS-level read-only mode (`file:...?mode=ro`) is continuous and strong — no writes to the main database file can succeed, ever. But `ATTACH DATABASE` is *not* blocked by VFS read-only (SQLite will attach another file, also read-only by default, and allow reads from it). Layer 1 (the sqlglot validator) is the only defense against `ATTACH` — it parses as `exp.Command` and is rejected at the whitelist root check. Similarly, `SELECT load_extension(...)` parses as a pure function call and passes Layer 1, so Layer 2 must separately disable extension loading via `conn.enable_load_extension(False)` at connect time. Both are documented in the SQLite backend module with explicit notes so future changes don't accidentally weaken either defense.
 
 ---
 
@@ -55,10 +58,11 @@ Claude Code / AI Agent
 | Component             | Package                     | Version | Why                                                           |
 | --------------------- | --------------------------- | ------- | ------------------------------------------------------------- |
 | MCP framework         | `mcp`                       | >=1.2.0 | Official Python SDK with FastMCP                              |
-| SQL parsing           | `sqlglot`                   | >=26.0  | Supports `postgres`, `clickhouse`, `mysql` dialects (MariaDB covered by mysql) |
+| SQL parsing           | `sqlglot`                   | >=26.0  | Supports `postgres`, `clickhouse`, `mysql`, `sqlite` dialects (MariaDB covered by mysql) |
 | PostgreSQL driver     | `asyncpg`                   | >=0.29  | Fast async driver, native read-only transaction support       |
 | ClickHouse driver     | `clickhouse-connect`        | >=0.7   | Official ClickHouse Python client                             |
 | MySQL/MariaDB driver  | `asyncmy`                   | >=0.2.9 | Native-async Cython driver (aiomysql-compatible API). One driver serves both. |
+| SQLite driver         | `sqlite3` (stdlib)          | n/a     | Python standard library. No new dep. Wrapped in `asyncio.to_thread()`. |
 | Config                | `python-dotenv`             | >=1.0   | Env var / .env parsing (simple, no validation overhead)       |
 | Testing               | `pytest` + `pytest-asyncio` | latest  | Async test support                                            |
 
@@ -87,6 +91,7 @@ readonly-db-mcp/
         postgres.py           # asyncpg pool, read-only transactions, health checks
         clickhouse.py         # clickhouse-connect client, readonly=1, reconnection
         mysql.py              # asyncmy pool, SESSION READ ONLY + per-query START TRANSACTION READ ONLY; serves both MySQL and MariaDB
+        sqlite.py             # stdlib sqlite3 wrapped in asyncio.to_thread; VFS-level read-only open (file:?mode=ro); extension loading disabled
   tests/
     test_validation.py        # SQL validation tests (security-critical)
     test_config.py            # Config parsing tests
@@ -136,6 +141,13 @@ MARIADB_1_DATABASE=legacy_app
 MARIADB_1_USER=ai_reader
 MARIADB_1_PASSWORD=secret
 
+# SQLite connections (SQLITE_1_, SQLITE_2_, etc.)
+# SQLite is a single-file database — no host, port, user, or password.
+# Operators control which file paths are reachable. The connection is
+# opened in VFS-level read-only mode (`file:<path>?mode=ro`).
+SQLITE_1_NAME=local_dev
+SQLITE_1_PATH=/var/data/app.db
+
 # Global settings
 QUERY_TIMEOUT_SECONDS=30       # Per-query timeout
 MAX_RESULT_ROWS=1000           # Truncate results beyond this
@@ -181,7 +193,7 @@ Claude Code auto-discovers the tools. No further setup.
 
 ## MCP Tools
 
-Ten tools are exposed to the AI. Dedicated tools should be preferred over raw SQL where available — they're cheaper, clearer, and don't hit the "SELECT-only" rejection path.
+Eleven tools are exposed to the AI. Dedicated tools should be preferred over raw SQL where available — they're cheaper, clearer, and don't hit the "SELECT-only" rejection path.
 
 ### 1. `query_postgres`
 
@@ -231,7 +243,19 @@ Execute a read-only SQL query against MariaDB.
 
 Returns: results rendered in the requested format. Separate tool from `query_mysql` because MariaDB has distinct timeout semantics (`max_statement_time` in seconds, vs MySQL's `max_execution_time` in ms) and operator-facing config (`MARIADB_N_*` prefix). Shares the MySQL wire protocol and sqlglot parser.
 
-### 5. `list_databases`
+### 5. `query_sqlite`
+
+Execute a read-only SQL query against a SQLite database file.
+
+| Parameter       | Type   | Required | Description                                                     |
+| --------------- | ------ | -------- | --------------------------------------------------------------- |
+| `sql`           | string | yes      | The SQL query                                                   |
+| `database`      | string | no       | Named SQLite **connection** (default: first configured)         |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`                 |
+
+Returns: results rendered in the requested format. SQLite is opened in VFS-level read-only mode at connect time (`file:<path>?mode=ro`), which means the database file cannot be modified for the life of the connection. `ATTACH DATABASE`, `PRAGMA writable_schema=ON`, and all DDL/DML are rejected at the sqlglot validation layer. `SELECT load_extension(...)` is blocked at connect time via `enable_load_extension(False)`. No pool is needed — SQLite is file-based and cheap to open.
+
+### 6. `list_databases`
 
 List all configured database connections.
 
@@ -241,7 +265,7 @@ List all configured database connections.
 
 Returns: list of `{name, type, host, database}`. The `name` is what you pass as `database=...` to other tools — it's an alias, **not** a PG schema or CH database.
 
-### 6. `list_tables`
+### 7. `list_tables`
 
 List tables in a database.
 
@@ -252,7 +276,7 @@ List tables in a database.
 
 Returns: list of table names. When `schema` is omitted, each backend uses its natural default (all non-system schemas for PG; the connection's configured database for CH/MySQL/MariaDB). When `schema` is provided, the backend scopes its metadata query to that schema via a parameterized SELECT against `pg_tables` / `system.tables` / `information_schema.tables` — no string interpolation. PostgreSQL still returns `schema.table` format regardless, so the output shape is uniform.
 
-### 7. `describe_table`
+### 8. `describe_table`
 
 Show columns, types, and nullability for a table. For ClickHouse, also returns engine, total_rows, total_bytes, primary_key, sorting_key, and partition_key (read from `system.tables`, silently skipped if the user lacks that grant).
 
@@ -263,7 +287,7 @@ Show columns, types, and nullability for a table. For ClickHouse, also returns e
 
 Returns: markdown table of column definitions, plus an optional metadata section.
 
-### 8. `sample_table`
+### 9. `sample_table`
 
 Return the first N rows of a table — the "give me a peek" shortcut.
 
@@ -276,7 +300,7 @@ Return the first N rows of a table — the "give me a peek" shortcut.
 
 Internally issues `SELECT * FROM <safe_table> LIMIT <n>` through the same validation path as `query_*`. Table names are validated against the safe-identifier regex before interpolation.
 
-### 9. `explain_query`
+### 10. `explain_query`
 
 Show the query execution plan.
 
@@ -284,13 +308,15 @@ Show the query execution plan.
 | ---------- | ------- | -------- | ------------------------------------------------------------ |
 | `sql`      | string  | yes      | The SELECT query to explain (validated as read-only first)   |
 | `database` | string  | yes      | Connection name                                              |
-| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (PG only; ignored for CH / MySQL / MariaDB, default false) |
+| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (PG only; ignored for CH / MySQL / MariaDB / SQLite, default false) |
 
 Returns: query plan as text. The inner SQL is validated as read-only *before* EXPLAIN is prepended, which blocks the `EXPLAIN ANALYZE DELETE ...` bypass in PostgreSQL and MySQL 8.0.18+.
 
 **Why `analyze=true` is ignored for MySQL/MariaDB:** MySQL 8.0.18+ `EXPLAIN ANALYZE` and MariaDB's `ANALYZE <stmt>` both execute the inner query (like PostgreSQL's EXPLAIN ANALYZE). Although the inner SQL is already validated as read-only so DELETE/UPDATE cannot slip through, we take a conservative stance: the MySQL/MariaDB backends run plain `EXPLAIN` regardless of the flag (strictly plan-only, no execution) and append a note to the output when the flag was set. Keep MySQL plan analysis at the SQL layer (`SELECT * FROM information_schema.statistics WHERE ...`) if deeper timing is needed.
 
-### 10. `usage_guide`
+**Why `analyze=true` is a no-op for SQLite:** SQLite's `EXPLAIN QUERY PLAN` is strictly plan-only — it never executes the inner query — so there's nothing useful to do with the `analyze` flag. We accept it for interface consistency and append a note when set.
+
+### 11. `usage_guide`
 
 Return a cheatsheet describing all tools, typical workflows, output formats, and schema-qualification rules. Use when unsure which tool to reach for.
 
@@ -921,6 +947,24 @@ The COMMIT at the end is a no-op on the server for read-only transactions, so th
 
 MySQL 8.0.18+ and MariaDB's `ANALYZE <stmt>` both execute the inner query. For PostgreSQL we accept this because the outer read-only transaction blocks any write side effects (EXPLAIN ANALYZE can time a DELETE inside a read-only transaction, which is a rollback). For MySQL/MariaDB we take a stricter stance and always run plain `EXPLAIN` — even though our outer read-only transaction would also roll back any writes, the extra defense-in-depth here costs nothing (you can still read the execution plan) and removes any chance that a future MySQL bug, a misconfigured connection, or a stored procedure with `SECURITY DEFINER` privileges lets an ANALYZE-time side effect commit.
 
+### Why use stdlib `sqlite3` for SQLite instead of an async driver like `aiosqlite`?
+
+Two reasons:
+
+1. **No new dependency.** `sqlite3` is in the Python stdlib. `aiosqlite` is a thin wrapper that still uses `sqlite3` under the hood — it spawns a dedicated thread per connection to run the blocking calls. We can achieve the same by wrapping `sqlite3` calls in `asyncio.to_thread()`, which is exactly what the ClickHouse backend already does (for `clickhouse-connect`). Pattern consistency over a new dep.
+2. **SQLite queries are typically fast.** The overhead of `asyncio.to_thread()` (thread hop, ~tens of microseconds) is insignificant for most SQLite workloads. For heavy SQLite use cases (e.g., analytical queries on large .db files), users are probably on DuckDB anyway.
+
+### SQLite's unique trust boundary: filesystem paths
+
+Every other backend treats "who can see what" as a database-user question (GRANT SELECT ON schema). SQLite has no GRANT — the database is a file, and filesystem permissions are the authorization model. This means **operators must treat `SQLITE_N_PATH` env vars the way they treat GRANT statements on other backends**: each configured path is a bundle of capabilities, and misconfiguration (e.g., pointing at `/etc/passwd` — SQLite rejects it as "not a database", but still an OOPS) is an operator concern.
+
+Things we actively do to limit blast radius within this model:
+
+1. Open files via `file:<path>?mode=ro` (VFS-level read-only). Main DB is immutable.
+2. `enable_load_extension(False)` so `SELECT load_extension(...)` can't load arbitrary .so files and bypass everything.
+3. Reject `ATTACH DATABASE` at the validator level. Without this, a caller could attach a file the operator didn't configure (the attached DB would be read-only too, but still widens the operator's stated reachable-path set).
+4. Reject `PRAGMA writable_schema=ON` (sqlglot parses `PRAGMA` as `exp.Command`, rejected at the root).
+
 ### Why asyncpg for PostgreSQL but not an async ClickHouse client?
 
 asyncpg is a mature, battle-tested async PostgreSQL driver with connection pooling and health checks built-in. ClickHouse's official Python client (`clickhouse-connect`) is synchronous and uses HTTP under the hood (no persistent connections). We wrap all `clickhouse-connect` calls in `asyncio.to_thread()` to avoid blocking the event loop. This is pragmatic — the overhead is acceptable, and the alternative (using an unofficial async client) introduces more risk.
@@ -1000,6 +1044,15 @@ GRANT SELECT ON legacy_app.* TO 'ai_reader'@'%';
 ```
 
 Same privilege posture as MySQL. MariaDB's `SHOW GRANTS FOR 'ai_reader'@'%'` should show only `GRANT SELECT ON legacy_app.*` and `GRANT USAGE ON *.*` (USAGE is implicit connect).
+
+### SQLite
+
+SQLite has no GRANT system. Authorization is filesystem-level:
+
+1. **Use a dedicated unix user for the MCP server process.** That user should have `r--` (read-only) access to the `.db` file and `r-x` on the directory that contains it. Don't give the MCP process write access "just in case" — the VFS read-only URI is belt, but filesystem permissions are suspenders.
+2. **Put `.db` files on their own path prefix you can audit.** e.g. `/var/data/mcp-readonly/*.db` — one glob you can point an auditing tool at, and the operator knows at a glance which databases are reachable.
+3. **Do not configure the MCP server with a path that contains symlinks pointing out of that prefix.** SQLite follows symlinks silently.
+4. **Never configure a SQLite path that the MCP process itself writes to.** If the DB is shared with another process that writes, the MCP server's queries may observe inconsistent state (SQLite WAL mode handles concurrent readers/writers correctly, but from an operations standpoint, feeding the AI live-updating data is rarely what you want — use a snapshot instead).
 
 ---
 

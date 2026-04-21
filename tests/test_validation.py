@@ -287,3 +287,68 @@ class TestMysqlDialectQueries:
         so it must be rejected."""
         with pytest.raises(ValueError):
             validate_read_only("ANALYZE SELECT * FROM users", dialect="mysql")
+
+
+class TestSqliteDialectQueries:
+    """Validator parity for the sqlite dialect."""
+
+    def test_simple_select_passes(self) -> None:
+        validate_read_only("SELECT * FROM users", dialect="sqlite")
+
+    def test_cte_passes(self) -> None:
+        validate_read_only(
+            "WITH cte AS (SELECT 1 AS x) SELECT * FROM cte",
+            dialect="sqlite",
+        )
+
+    def test_sqlite_insert_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("INSERT INTO users VALUES (1, 'x')", dialect="sqlite")
+
+    def test_sqlite_update_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("UPDATE users SET name = 'x' WHERE id = 1", dialect="sqlite")
+
+    def test_sqlite_delete_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Only SELECT queries are allowed"):
+            validate_read_only("DELETE FROM users WHERE id = 1", dialect="sqlite")
+
+    def test_sqlite_attach_database_rejected(self) -> None:
+        """ATTACH DATABASE is SQLite-specific and opens another file. Even
+        though our VFS read-only mode at the connection layer would also
+        block it (ATTACH requires a writable main database), the validator
+        must reject it at parse time for defense-in-depth."""
+        with pytest.raises(ValueError):
+            validate_read_only(
+                "ATTACH DATABASE '/tmp/other.db' AS other",
+                dialect="sqlite",
+            )
+
+    def test_sqlite_detach_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            validate_read_only("DETACH DATABASE other", dialect="sqlite")
+
+    def test_sqlite_create_table_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            validate_read_only("CREATE TABLE t (id INT)", dialect="sqlite")
+
+    def test_sqlite_pragma_writable_schema_rejected(self) -> None:
+        """PRAGMA writable_schema=ON is the SQLite equivalent of escalating
+        privileges — it lets SELECT modify internal catalog rows. sqlglot
+        parses it as a Command, so the whitelist rejects it."""
+        with pytest.raises(ValueError):
+            validate_read_only("PRAGMA writable_schema = ON", dialect="sqlite")
+
+    def test_sqlite_show_rejected_with_hint(self) -> None:
+        with pytest.raises(ValueError, match="list_tables"):
+            validate_read_only("SHOW TABLES", dialect="sqlite")
+
+    def test_sqlite_select_load_extension_passes_validator(self) -> None:
+        """SELECT load_extension(...) looks like a pure SELECT to the AST
+        parser — the Layer 2 defense (enable_load_extension=False on the
+        connection) is what actually blocks this at runtime, not the
+        validator. This test documents the validator's behavior explicitly
+        so future changes don't accidentally rely on it."""
+        # This MUST pass the validator — it's a plain SELECT by AST shape.
+        # The runtime block happens in the SQLite backend's _open_readonly.
+        validate_read_only("SELECT load_extension('/tmp/evil.so')", dialect="sqlite")
