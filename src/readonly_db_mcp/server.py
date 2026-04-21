@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from .config import load_config, Config
 from .databases.base import DatabaseBackend, validate_identifier
 from .databases.clickhouse import ClickHouseBackend
+from .databases.mysql import MariaDBBackend, MySQLBackend
 from .databases.postgres import PostgresBackend
 from .formatting import format_results, format_markdown_table
 from .validation import validate_read_only
@@ -72,9 +73,14 @@ async def lifespan(server: FastMCP):
     config = load_config()
     ctx = AppContext(config=config)
 
-    # Check for duplicate names across PG and CH connections. Backends are
-    # stored in a flat dict keyed by name, so duplicates would silently overwrite.
-    all_names = [pg.name for pg in config.postgres_connections] + [ch.name for ch in config.clickhouse_connections]
+    # Check for duplicate names across all backends. Backends are stored in a
+    # flat dict keyed by name, so duplicates would silently overwrite.
+    all_names = (
+        [pg.name for pg in config.postgres_connections]
+        + [ch.name for ch in config.clickhouse_connections]
+        + [my.name for my in config.mysql_connections]
+        + [md.name for md in config.mariadb_connections]
+    )
     seen: set[str] = set()
     for name in all_names:
         if name in seen:
@@ -83,7 +89,13 @@ async def lifespan(server: FastMCP):
 
     pg_count = len(config.postgres_connections)
     ch_count = len(config.clickhouse_connections)
-    logger.info("Starting readonly-db-mcp with %d PostgreSQL and %d ClickHouse connections", pg_count, ch_count)
+    my_count = len(config.mysql_connections)
+    md_count = len(config.mariadb_connections)
+    total_count = pg_count + ch_count + my_count + md_count
+    logger.info(
+        "Starting readonly-db-mcp with %d PostgreSQL, %d ClickHouse, %d MySQL, %d MariaDB connections",
+        pg_count, ch_count, my_count, md_count,
+    )
 
     try:
         # Initialize PostgreSQL connection pools
@@ -115,14 +127,38 @@ async def lifespan(server: FastMCP):
             except Exception:
                 logger.exception("Failed to connect to ClickHouse '%s' — skipping this backend", ch.name)
 
+        # Initialize MySQL connection pools. MySQLBackend and MariaDBBackend
+        # share an asyncmy-based implementation but declare distinct
+        # class-level db_type values, matching the PG/CH pattern.
+        for my in config.mysql_connections:
+            backend = MySQLBackend(my, config)
+            logger.info("Connecting to MySQL '%s' at %s:%d/%s", my.name, my.host, my.port, my.database)
+            try:
+                await backend.connect()
+                ctx.backends[my.name] = backend
+                logger.info("Connected to MySQL '%s'", my.name)
+            except Exception:
+                logger.exception("Failed to connect to MySQL '%s' — skipping this backend", my.name)
+
+        # Initialize MariaDB connection pools
+        for md in config.mariadb_connections:
+            backend = MariaDBBackend(md, config)
+            logger.info("Connecting to MariaDB '%s' at %s:%d/%s", md.name, md.host, md.port, md.database)
+            try:
+                await backend.connect()
+                ctx.backends[md.name] = backend
+                logger.info("Connected to MariaDB '%s'", md.name)
+            except Exception:
+                logger.exception("Failed to connect to MariaDB '%s' — skipping this backend", md.name)
+
         # At least one backend must have succeeded, otherwise the server is useless
         if not ctx.backends:
             raise RuntimeError(
-                f"Failed to connect to all {pg_count + ch_count} configured databases. "
+                f"Failed to connect to all {total_count} configured databases. "
                 "Check connection settings and ensure at least one database is reachable."
             )
 
-        logger.info("Successfully connected to %d of %d configured databases", len(ctx.backends), pg_count + ch_count)
+        logger.info("Successfully connected to %d of %d configured databases", len(ctx.backends), total_count)
         yield ctx  # Server is now running and accepting tool calls
     finally:
         # Clean up: disconnect all backends that were successfully connected.
@@ -144,25 +180,49 @@ async def lifespan(server: FastMCP):
 mcp = FastMCP("readonly-db-mcp", lifespan=lifespan)
 
 
+_QUERY_TOOL_FOR_TYPE = {
+    "postgres": "query_postgres",
+    "clickhouse": "query_clickhouse",
+    "mysql": "query_mysql",
+    "mariadb": "query_mariadb",
+}
+
+
 def _get_backend(ctx: Context, name: str | None, db_type: str | None = None) -> DatabaseBackend:
     """Resolve a database backend by name, or return the first matching type.
 
     Args:
         ctx:     The MCP context (contains the AppContext with all backends).
         name:    Specific connection name (e.g. "prod_db"). If provided, must
-                 match exactly. If None, returns the first backend of db_type.
-        db_type: Filter by type ("postgres" or "clickhouse"). Only used when
-                 name is None.
+                 match exactly.
+        db_type: Filter by type ("postgres" | "clickhouse" | "mysql" | "mariadb").
+                 If set, the resolved backend MUST be of this type regardless
+                 of whether `name` was given — this prevents cross-flavor
+                 bypasses like calling query_mariadb(database="my_postgres_conn"),
+                 which would otherwise happily run MariaDB-flavored timeout SQL
+                 against a PostgreSQL backend.
 
     Raises:
-        ValueError: If the named database doesn't exist, or no database of
-                    the requested type is configured.
+        ValueError: If the named database doesn't exist; if the named database
+                    exists but has the wrong db_type; or if no unnamed database
+                    of the requested type is configured.
     """
     app: AppContext = ctx.request_context.lifespan_context
     if name:
         if name not in app.backends:
             raise ValueError(f"Unknown database: {name}. Available: {list(app.backends.keys())}")
-        return app.backends[name]
+        backend = app.backends[name]
+        # Enforce db_type even when a name was provided. Without this check,
+        # the tool-level separation (query_postgres vs query_mysql vs ...) is
+        # advisory only — a caller could hand query_mariadb a postgres name
+        # and the validator + backend would mismatch.
+        if db_type is not None and backend.db_type != db_type:
+            correct_tool = _QUERY_TOOL_FOR_TYPE.get(backend.db_type, f"query_{backend.db_type}")
+            raise ValueError(
+                f"Database {name!r} is a {backend.db_type} connection, not {db_type}. "
+                f"Use `{correct_tool}` for this connection instead."
+            )
+        return backend
     # No name given — return the first backend matching the requested type
     for backend in app.backends.values():
         if db_type is None or backend.db_type == db_type:
@@ -192,6 +252,37 @@ def _safe_error_message(exc: Exception) -> str:
     return first_line
 
 
+# Substrings that signal a schema-level mistake (typo in a column name, missing
+# table, unknown identifier). If any of these appears in a driver's error
+# message, we append a hint pointing the AI at the dedicated discovery tools
+# instead of having it guess from the bare driver text. This is UX only — the
+# hint is suffixed to the already-forwarded driver message, never replaces it.
+_SCHEMA_ERROR_MARKERS = (
+    "unknown column",       # MySQL/MariaDB: Unknown column 'foo' in 'field list'
+    "unknown identifier",   # ClickHouse: Unknown identifier 'foo'
+    "unknown table",        # MySQL/MariaDB: Unknown table 'foo'
+    "does not exist",       # PostgreSQL: column "foo" does not exist / relation "foo" does not exist
+    "no such column",       # SQLite-style (future-proofing; some drivers use it)
+    "no such table",
+)
+
+
+def _schema_error_hint(err_msg: str) -> str:
+    """Return a hint suffix for schema-shaped errors, or empty string.
+
+    We match case-insensitively on common substrings emitted by the four
+    drivers. The hint never makes assumptions about which column or table —
+    it just points the AI at the tools it should have called first.
+    """
+    lowered = err_msg.lower()
+    if any(marker in lowered for marker in _SCHEMA_ERROR_MARKERS):
+        return (
+            " (common cause: column/table not found — call `describe_table` "
+            "to see actual column names, or `list_tables` to confirm the table exists)"
+        )
+    return ""
+
+
 def _validate_output_format(fmt: str) -> str:
     """Validate the output_format param and return it, or raise ValueError."""
     if fmt not in ("table", "vertical", "json"):
@@ -199,6 +290,21 @@ def _validate_output_format(fmt: str) -> str:
             f"Invalid output_format: {fmt!r}. Must be one of: 'table', 'vertical', 'json'."
         )
     return fmt
+
+
+def _dialect_for_backend(backend: DatabaseBackend) -> str:
+    """Map a backend's db_type to the sqlglot dialect used for parsing/validation.
+
+    MySQL and MariaDB share sqlglot's "mysql" dialect — the parser handles
+    MariaDB-specific extensions like backtick quoting and most MySQL syntax
+    without issue. Divergent features are beyond SELECT-shape validation and
+    don't affect the read-only guarantee.
+    """
+    if backend.db_type == "postgres":
+        return "postgres"
+    if backend.db_type in ("mysql", "mariadb"):
+        return "mysql"
+    return "clickhouse"
 
 
 # ── Tool definitions ─────────────────────────────────────────────────────────
@@ -263,9 +369,12 @@ async def query_postgres(
         # Never expose stack traces. Do forward the driver's error message so
         # the AI can see *why* the query failed ("Unknown table", "syntax error
         # at position N", etc.) — this information is already visible to anyone
-        # who could send the query, so there's no new exposure.
+        # who could send the query, so there's no new exposure. On common
+        # schema-shaped errors, append a hint that points the AI at the tools
+        # it should have called first.
         logger.exception("query_postgres execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -293,6 +402,11 @@ async def query_clickhouse(
       sql:           The SQL query. Fully-qualify tables across schemas like
                      `develop_db.events` — the `database` param below picks
                      the *connection*, not the ClickHouse schema.
+                     ClickHouse identifiers (column/table names) are
+                     case-sensitive and often not what you'd guess
+                     (e.g. `datetime`, not `timestamp` or `ts`). Always run
+                     `describe_table` before writing queries against an
+                     unfamiliar table — guessing column names is costly here.
       database:      Connection name configured in env vars (e.g. "analytics").
                      This is the *connection name*, not a ClickHouse database.
                      Defaults to the first configured ClickHouse connection.
@@ -317,7 +431,116 @@ async def query_clickhouse(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("query_clickhouse execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
+
+
+@mcp.tool()
+async def query_mysql(
+    sql: str,
+    ctx: Context,
+    database: str | None = None,
+    output_format: str = "table",
+) -> str:
+    """Execute a read-only SELECT against MySQL.
+
+    Use this for ad-hoc queries with JOINs, aggregations, window functions
+    (MySQL 8.0+), etc. For common lookups there are dedicated tools that are
+    faster and cheaper — prefer them:
+      - `list_tables` / `list_databases` — discovery (don't write SHOW TABLES)
+      - `describe_table` — columns + engine + row-count estimate + primary key
+        (don't write DESCRIBE)
+      - `sample_table` — peek at a few rows of a table
+      - `explain_query` — execution plan (don't write EXPLAIN)
+
+    Only SELECT-family queries pass validation. INSERT/UPDATE/DELETE/DDL are
+    rejected by a sqlglot AST check before reaching the database.
+
+    Safety note: MySQL 8.0.18+ EXPLAIN ANALYZE actually executes the inner
+    query (same as PostgreSQL). The `explain_query` tool validates the inner
+    SQL is a SELECT before prepending EXPLAIN, so this path is safe — but
+    raw `EXPLAIN ANALYZE ...` via this tool is rejected.
+
+    Params:
+      sql:           The SQL query.
+      database:      Connection name configured in env vars (e.g. "prod_mysql").
+                     This is the *connection name*, not a MySQL database name.
+                     Defaults to the first configured MySQL connection.
+                     Use `list_databases` to see available connection names.
+      output_format: "table" (markdown, default) | "vertical" (key=value per
+                     row, no truncation — good for wide DDL/JSON cells) |
+                     "json" (strict JSON envelope, no truncation).
+
+    Results are capped at MAX_RESULT_ROWS (default 1000) via a server-side
+    LIMIT injection that preserves your ORDER BY.
+    """
+    try:
+        fmt = _validate_output_format(output_format)
+        clean_sql = validate_read_only(sql, dialect="mysql")
+        backend = _get_backend(ctx, database, db_type="mysql")
+        logger.debug("query_mysql [%s]: %s", backend.name, clean_sql[:200])
+        columns, rows, total = await backend.execute(clean_sql)
+        logger.debug("query_mysql [%s]: %d columns, %d rows returned", backend.name, len(columns), len(rows))
+        return format_results(columns, rows, total, output_format=fmt)
+    except ValueError as e:
+        logger.info("query_mysql validation error: %s", e)
+        return f"Error: {e}"
+    except Exception as e:
+        logger.exception("query_mysql execution failed")
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
+
+
+@mcp.tool()
+async def query_mariadb(
+    sql: str,
+    ctx: Context,
+    database: str | None = None,
+    output_format: str = "table",
+) -> str:
+    """Execute a read-only SELECT against MariaDB.
+
+    MariaDB shares MySQL's wire protocol and most SQL syntax, but has its own
+    extensions (e.g. `ANALYZE SELECT` for profiling) and different timeout
+    semantics (`max_statement_time` in seconds vs MySQL's `max_execution_time`
+    in milliseconds). This tool uses MariaDB-appropriate timeouts and
+    connects via `MARIADB_N_*` environment variables.
+
+    For common lookups prefer the dedicated tools:
+      - `list_tables` / `list_databases` — discovery (don't write SHOW TABLES)
+      - `describe_table` — columns + engine + row-count estimate + primary key
+        (don't write DESCRIBE)
+      - `sample_table` — peek at a few rows of a table
+      - `explain_query` — execution plan (don't write EXPLAIN or ANALYZE)
+
+    Safety note: MariaDB's `ANALYZE <stmt>` (and `EXPLAIN ANALYZE` in recent
+    versions) actually executes the inner query. The `explain_query` tool
+    only runs plain EXPLAIN (plan-only, no execution) so this is safe.
+
+    Params:
+      sql:           The SQL query.
+      database:      Connection name configured in env vars (e.g. "prod_mariadb").
+                     This is the *connection name*, not a MariaDB database name.
+                     Defaults to the first configured MariaDB connection.
+      output_format: "table" (markdown, default) | "vertical" | "json".
+    """
+    try:
+        fmt = _validate_output_format(output_format)
+        # sqlglot's "mysql" dialect handles MariaDB too — they share parse rules
+        # for SELECT-family statements.
+        clean_sql = validate_read_only(sql, dialect="mysql")
+        backend = _get_backend(ctx, database, db_type="mariadb")
+        logger.debug("query_mariadb [%s]: %s", backend.name, clean_sql[:200])
+        columns, rows, total = await backend.execute(clean_sql)
+        logger.debug("query_mariadb [%s]: %d columns, %d rows returned", backend.name, len(columns), len(rows))
+        return format_results(columns, rows, total, output_format=fmt)
+    except ValueError as e:
+        logger.info("query_mariadb validation error: %s", e)
+        return f"Error: {e}"
+    except Exception as e:
+        logger.exception("query_mariadb execution failed")
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -346,50 +569,81 @@ async def list_databases(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def list_tables(database: str, ctx: Context) -> str:
+async def list_tables(database: str, ctx: Context, schema: str | None = None) -> str:
     """List all tables visible to the configured user in a database connection.
 
-    For PostgreSQL, results are in `schema.table` format (system schemas like
-    pg_catalog and information_schema are excluded). For ClickHouse, results
-    are table names in the connection's default database only — to see tables
-    in other schemas, run `SELECT name FROM system.tables WHERE database = 'other'`.
+    Per-backend default behavior (no `schema` given):
+      - PostgreSQL: results in `schema.table` format across all non-system
+        schemas (pg_catalog and information_schema are excluded).
+      - ClickHouse: table names in the connection's default database only.
+      - MySQL / MariaDB: table names in the connection's default database only
+        (system schemas `mysql`, `information_schema`, `performance_schema`,
+        `sys` are excluded).
+
+    When `schema` is provided, listing is restricted to that schema. This is
+    the canonical way to discover tables in databases other than the
+    connection's default — you no longer have to write raw `SELECT` against
+    `system.tables` / `information_schema.tables` for this common case.
 
     Params:
       database: Connection name from `list_databases` (not a schema name).
+      schema:   Optional schema/database name to list tables from.
+                PG: a PostgreSQL schema (e.g. "public", "reporting").
+                CH: a ClickHouse database (e.g. "develop_db").
+                MySQL/MariaDB: a database name (e.g. "legacy_app").
 
     Next step: call `describe_table(database, table)` for columns and metadata,
     or `sample_table(database, table, n=5)` to see a few rows.
     """
     try:
         backend = _get_backend(ctx, database)
-        tables = await backend.list_tables()
+        # Validate the schema identifier before handing it to the backend.
+        # The backends parameterize it in their metadata queries (server-side
+        # binding), but defense-in-depth: reject obviously unsafe input here
+        # with a clear error message. validate_identifier allows dots, which
+        # is fine because PG's pg_tables.schemaname and CH's
+        # system.tables.database never contain dots in practice.
+        if schema is not None:
+            validate_identifier(schema)
+        tables = await backend.list_tables(schema=schema)
         if not tables:
+            if schema is not None:
+                return f"No tables found in schema {schema!r}."
             return "No tables found."
         return "\n".join(f"- {t}" for t in tables)
     except ValueError as e:
         return f"Error: {e}"
     except Exception as e:
         logger.exception("list_tables failed for '%s'", database)
-        return f"Error: failed to list tables: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: failed to list tables: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
 async def describe_table(database: str, table: str, ctx: Context) -> str:
-    """Show columns, types, and (for ClickHouse) engine + row/byte stats + keys.
+    """Show columns, types, and (where available) backend-specific table metadata.
 
-    This is the right tool to inspect a single table. For PostgreSQL, pass
-    `schema.table` (or just `table` for the public schema). For ClickHouse,
-    pass the table name — fully qualify as `db.table` if it's not in the
-    connection's default database.
+    This is the right tool to inspect a single table.
+
+    Table name format per backend:
+      - PostgreSQL:     `schema.table` (or just `table` for the public schema)
+      - ClickHouse:     `table` (or `db.table` if not in the connection's default db)
+      - MySQL / MariaDB: `table` (or `db.table` if not in the connection's default db)
+
+    Backend-specific metadata appended to the output when available:
+      - ClickHouse: engine, total_rows, total_bytes, primary_key, sorting_key,
+        partition_key (from system.tables; skipped silently if no grant)
+      - MySQL / MariaDB: engine, table_rows_estimate, primary_key, create_time,
+        update_time (from information_schema; skipped silently if no grant).
+        The "_estimate" suffix on `table_rows` is literal: for InnoDB tables
+        the value is an optimizer-maintained estimate that can be anywhere
+        from a few percent off to 40-50% off (sometimes reports 0 for small
+        tables). Treat it as an order-of-magnitude signal, not a count.
+        For an exact count, run `SELECT COUNT(*) FROM <table>`.
 
     Params:
       database: Connection name from `list_databases`.
-      table:    Table name. PG: "schema.table" or "table" (public schema default).
-                CH: "table" or "db.table".
-
-    ClickHouse output also includes engine, total_rows, total_bytes, primary_key,
-    sorting_key, and partition_key when available (requires SELECT on system.tables;
-    skipped silently if the user doesn't have that grant).
+      table:    Table name (see "Table name format per backend" above).
     """
     try:
         backend = _get_backend(ctx, database)
@@ -435,8 +689,10 @@ async def sample_table(
 
     Params:
       database:      Connection name from `list_databases`.
-      table:         Table name. PG: "schema.table" or "table" (public). CH:
-                     "table" or "db.table".
+      table:         Table name.
+                       PG:    "schema.table" or "table" (public schema default)
+                       CH:    "table" or "db.table"
+                       MySQL/MariaDB: "table" or "db.table"
       n:             How many rows to return (1..MAX_RESULT_ROWS, default 5).
       output_format: "table" | "vertical" | "json". See `query_postgres` for
                      details.
@@ -470,7 +726,7 @@ async def sample_table(
         # Full validation path — even though we built this SQL ourselves, we
         # run it through validate_read_only so the security contract holds
         # uniformly (no "trusted caller" exceptions).
-        dialect = "postgres" if backend.db_type == "postgres" else "clickhouse"
+        dialect = _dialect_for_backend(backend)
         clean_sql = validate_read_only(sql, dialect=dialect)
 
         columns, rows, total = await backend.execute(clean_sql)
@@ -479,7 +735,8 @@ async def sample_table(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("sample_table failed for '%s.%s'", database, table)
-        return f"Error: sample_table failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: sample_table failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -487,15 +744,24 @@ async def explain_query(sql: str, database: str, ctx: Context, analyze: bool = F
     """Show the execution plan for a SELECT query.
 
     The inner query is validated as read-only BEFORE being wrapped in EXPLAIN,
-    so EXPLAIN ANALYZE (which actually runs the query in PostgreSQL) can't
-    execute a DELETE or INSERT.
+    so EXPLAIN ANALYZE (which actually runs the query in PostgreSQL and in
+    MySQL 8.0.18+) can't execute a DELETE or INSERT.
+
+    Per-backend `analyze` handling:
+      - PostgreSQL: `analyze=True` runs EXPLAIN ANALYZE (actually executes the
+        query for real timing, inside a read-only transaction — safe).
+      - ClickHouse: `analyze=True` is ignored with an appended note (ClickHouse
+        has no equivalent).
+      - MySQL / MariaDB: `analyze=True` is ignored with an appended note.
+        We deliberately do NOT expose EXPLAIN ANALYZE here even though the
+        validator would reject writes: MySQL's `EXPLAIN ANALYZE` and MariaDB's
+        `ANALYZE <stmt>` both execute the inner query, and we prefer the
+        simpler safety argument that plain EXPLAIN never executes anything.
 
     Params:
       database: Connection name from `list_databases`.
       sql:      The SELECT query to explain.
-      analyze:  PostgreSQL only. If true, runs EXPLAIN ANALYZE (the query
-                executes and real timing is shown, inside a read-only
-                transaction). Ignored for ClickHouse (which has no equivalent).
+      analyze:  See per-backend handling above. Default False.
 
     Use this before running expensive queries to check that indexes are hit
     and the row count estimate is reasonable.
@@ -504,7 +770,7 @@ async def explain_query(sql: str, database: str, ctx: Context, analyze: bool = F
         backend = _get_backend(ctx, database)
         # Determine the SQL dialect from the backend type so the validator
         # parses the SQL correctly for the target database
-        dialect = "postgres" if backend.db_type == "postgres" else "clickhouse"
+        dialect = _dialect_for_backend(backend)
         clean_sql = validate_read_only(sql, dialect=dialect)
         plan = await backend.explain(clean_sql, analyze=analyze)
         return plan
@@ -512,7 +778,8 @@ async def explain_query(sql: str, database: str, ctx: Context, analyze: bool = F
         return f"Error: {e}"
     except Exception as e:
         logger.exception("explain_query failed for '%s'", database)
-        return f"Error: failed to explain query: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: failed to explain query: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -541,11 +808,15 @@ set up by the operator at server startup.
 
 - `list_databases` — See configured connections. Start here when exploring.
 - `list_tables` — See tables in a connection. Don't write `SHOW TABLES`.
-- `describe_table` — Columns + types; for ClickHouse also returns engine, row/byte stats, and keys. Don't write `DESCRIBE`.
+- `describe_table` — Columns + types; for ClickHouse also returns engine, row/byte stats, and keys; for MySQL/MariaDB returns engine, row-count estimate, and primary key. Don't write `DESCRIBE`.
 - `sample_table` — First N rows (default 5). Replaces "SELECT * LIMIT 5".
 - `query_postgres` — Ad-hoc SELECT against a PostgreSQL connection.
 - `query_clickhouse` — Ad-hoc SELECT against a ClickHouse connection.
-- `explain_query` — Execution plan. Don't write `EXPLAIN`.
+- `query_mysql` — Ad-hoc SELECT against a MySQL connection.
+- `query_mariadb` — Ad-hoc SELECT against a MariaDB connection.
+- `explain_query` — Execution plan. Don't write `EXPLAIN`. (MySQL/MariaDB:
+  plain EXPLAIN only — `EXPLAIN ANALYZE` / `ANALYZE SELECT` actually execute
+  the inner query and are deliberately not exposed via this tool.)
 
 ## Typical workflow
 1. `list_databases` → pick a connection
@@ -567,13 +838,52 @@ The `database` param picks the *connection*, not the schema. Fully qualify
 tables that live outside the connection's default schema:
   `SELECT * FROM develop_db.events LIMIT 10`
 To list tables in a different schema:
-  `SELECT name FROM system.tables WHERE database = 'develop_db'`
+  `list_tables(database="analytics", schema="develop_db")`
+
+ClickHouse identifiers are **case-sensitive** and often unexpected
+(`datetime`, not `ts` or `timestamp`; `eventType`, not `event_type`). Always
+`describe_table` before querying an unfamiliar table — you will guess wrong.
+
+## MySQL / MariaDB schemas
+Same idea as ClickHouse: `database=` is the connection alias, not a MySQL
+database. The connection has a default database (set at connect time) and
+unqualified table names resolve against it. To query another database on
+the same connection, qualify explicitly:
+  `SELECT * FROM other_db.orders LIMIT 10`
+To list tables in another database:
+  `list_tables(database="prod_mysql", schema="other_db")`
+Note: the configured read-only user must have SELECT on the target database
+for the query to succeed.
+
+On MySQL/MariaDB, `describe_table` returns `table_rows_estimate` rather than
+an exact row count. For InnoDB tables this is an optimizer-maintained
+*estimate* that can be off by tens of percent (sometimes 40-50%), and
+sometimes reports 0 for small tables. If you need an accurate count run
+`SELECT COUNT(*) FROM <table>` explicitly.
+
+## MySQL vs MariaDB tool choice
+Use `query_mysql` for MySQL connections (configured via `MYSQL_N_*` env vars)
+and `query_mariadb` for MariaDB connections (configured via `MARIADB_N_*`).
+They share most behavior but use different server-side timeout variables
+under the hood; picking the wrong tool fails fast with a clear error:
+  - If no database of the right type is configured at all, you get
+    `No mysql/mariadb database configured`.
+  - If you pass an explicit `database=` that names a different-flavored
+    connection (e.g. `query_mariadb(database="my_mysql_conn")`), you get
+    `Database 'my_mysql_conn' is a mysql connection, not mariadb.
+    Use 'query_mysql' for this connection instead.`
+Same enforcement applies across every type pair (PG/CH/MySQL/MariaDB) —
+connection-name lookups never cross flavor boundaries silently.
 
 ## Write safety (informational)
 All write operations (INSERT/UPDATE/DELETE/DDL) are rejected at the SQL
 parse layer. The DB user should also have SELECT-only grants. Raw
 `SHOW`/`DESCRIBE`/`EXPLAIN`/`EXISTS` commands are rejected too — use the
 dedicated tools above instead.
+
+For MySQL/MariaDB specifically: `EXPLAIN ANALYZE <stmt>` executes the inner
+query (same as PostgreSQL's EXPLAIN ANALYZE). `explain_query` always uses
+plain `EXPLAIN` (plan-only, no execution) to keep this safe.
 
 ## Result limits
 Every query is capped at `MAX_RESULT_ROWS` (default 1000) via LIMIT

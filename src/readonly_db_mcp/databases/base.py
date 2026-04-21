@@ -189,13 +189,27 @@ class DatabaseBackend(ABC):
         ...
 
     @abstractmethod
-    async def list_tables(self) -> list[str]:
+    async def list_tables(self, schema: str | None = None) -> list[str]:
         """
         List all user-accessible tables in the database.
 
+        Args:
+            schema: Optional schema/database to list tables from. When None,
+                    each backend uses its "default" scope:
+                      - PostgreSQL: all non-system schemas (returns "schema.table")
+                      - ClickHouse: the connection's configured default database
+                      - MySQL / MariaDB: the connection's configured default database
+                    When provided, the backend restricts results to that single
+                    schema. Callers MUST validate the identifier (via
+                    `validate_identifier`) before passing it through, because
+                    most backends interpolate or parameterize it into the
+                    metadata query.
+
         Returns:
             List of table names. For PostgreSQL, these are in "schema.table"
-            format (e.g. "public.users"). For ClickHouse, just table names.
+            format regardless of the schema filter (so output shape stays
+            uniform). For ClickHouse / MySQL / MariaDB, plain table names
+            (scoped to the requested schema).
         """
         ...
 

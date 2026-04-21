@@ -10,6 +10,8 @@ from readonly_db_mcp.server import (
     _get_backend,
     query_postgres,
     query_clickhouse,
+    query_mysql,
+    query_mariadb,
     list_databases,
     list_tables,
     describe_table,
@@ -66,6 +68,32 @@ def _make_ch_backend(name: str = "testch") -> MagicMock:
     )
     backend.table_stats = AsyncMock(return_value=None)  # can be overridden per-test
     backend.explain = AsyncMock(return_value="Expression\n  ReadFromMergeTree")
+    return backend
+
+
+def _make_mysql_backend(name: str = "testmysql", db_type: str = "mysql") -> MagicMock:
+    """Create a mock MySQL/MariaDB backend.
+
+    The real classes are `MySQLBackend` and `MariaDBBackend` (each with its
+    own class-level db_type), but from the server's perspective the only
+    contract is the abstract DatabaseBackend method set + the db_type attr.
+    Pass db_type="mariadb" to exercise MariaDB routing in _get_backend.
+    """
+    backend = MagicMock()
+    backend.db_type = db_type
+    backend.host = "myhost"
+    backend.database = "mydb"
+    backend.name = name
+    backend.execute = AsyncMock(return_value=(["id", "name"], [(1, "Alice"), (2, "Bob")], 2))
+    backend.list_tables = AsyncMock(return_value=["users", "orders"])
+    backend.describe_table = AsyncMock(
+        return_value=[
+            {"name": "id", "type": "int unsigned", "nullable": "NO"},
+            {"name": "name", "type": "varchar(255)", "nullable": "YES"},
+        ]
+    )
+    backend.table_stats = AsyncMock(return_value=None)
+    backend.explain = AsyncMock(return_value="  id: 1\n  select_type: SIMPLE\n  table: users")
     return backend
 
 
@@ -178,6 +206,40 @@ class TestListTables:
         ctx = _make_ctx({})
         result = await list_tables("nope", ctx)
         assert "Error:" in result
+
+    async def test_schema_param_forwarded_to_backend(self) -> None:
+        """When a schema is given, the backend's list_tables should be called
+        with schema=... so the backend can scope its metadata query."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        await list_tables("testpg", ctx, schema="reporting")
+        pg.list_tables.assert_called_once_with(schema="reporting")
+
+    async def test_no_schema_passes_none_to_backend(self) -> None:
+        """Without a schema, the backend gets schema=None — default scope."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        await list_tables("testpg", ctx)
+        pg.list_tables.assert_called_once_with(schema=None)
+
+    async def test_schema_identifier_validated(self) -> None:
+        """Unsafe schema names must be rejected before reaching the backend.
+        Even though backends parameterize the value, defense-in-depth: catch
+        obviously-bad input here with a clear error."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        result = await list_tables("testpg", ctx, schema="foo; DROP TABLE bar")
+        assert "Error:" in result
+        assert "Invalid identifier" in result
+        pg.list_tables.assert_not_called()
+
+    async def test_empty_result_for_schema_mentions_schema(self) -> None:
+        pg = _make_pg_backend()
+        pg.list_tables = AsyncMock(return_value=[])
+        ctx = _make_ctx({"testpg": pg})
+        result = await list_tables("testpg", ctx, schema="empty_schema")
+        assert "empty_schema" in result
+        assert "No tables found" in result
 
 
 class TestDescribeTable:
@@ -373,3 +435,311 @@ class TestErrorForwarding:
         # Message truncated at 500 chars
         assert "x" * 600 not in result
         assert "..." in result
+
+
+class TestSchemaErrorHint:
+    """Schema-shaped driver errors (unknown column, unknown table, etc.) should
+    suffix a hint pointing the AI at describe_table / list_tables.
+
+    The hint never replaces the driver's message — it's appended. Driver
+    messages that don't look schema-related pass through unchanged."""
+
+    async def test_mysql_unknown_column_gets_hint(self) -> None:
+        my = _make_mysql_backend()
+        my.execute = AsyncMock(
+            side_effect=RuntimeError("(1054, \"Unknown column 'foo' in 'field list'\")")
+        )
+        ctx = _make_ctx({"testmysql": my})
+        result = await query_mysql("SELECT foo FROM users", ctx)
+        # Driver's message is preserved
+        assert "Unknown column" in result
+        # Hint points at the right tools
+        assert "describe_table" in result
+        assert "list_tables" in result
+
+    async def test_postgres_column_does_not_exist_gets_hint(self) -> None:
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(
+            side_effect=RuntimeError('column "foo" does not exist')
+        )
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT foo FROM users", ctx)
+        assert "does not exist" in result
+        assert "describe_table" in result
+
+    async def test_clickhouse_unknown_identifier_gets_hint(self) -> None:
+        ch = _make_ch_backend()
+        ch.execute = AsyncMock(
+            side_effect=RuntimeError("Code: 47. DB::Exception: Unknown identifier: foo")
+        )
+        ctx = _make_ctx({"testch": ch})
+        result = await query_clickhouse("SELECT foo FROM events", ctx)
+        assert "Unknown identifier" in result
+        assert "describe_table" in result
+
+    async def test_generic_error_does_not_get_hint(self) -> None:
+        """A timeout or connection error shouldn't suggest describe_table —
+        that would mislead the AI."""
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(side_effect=RuntimeError("connection refused"))
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT 1", ctx)
+        assert "connection refused" in result
+        assert "describe_table" not in result
+
+    async def test_explain_query_unknown_column_gets_hint(self) -> None:
+        """User's reported scenario: EXPLAIN of a query with a bad column name.
+        The hint should show up on the explain path too."""
+        pg = _make_pg_backend()
+        pg.explain = AsyncMock(
+            side_effect=RuntimeError('column "typo" does not exist')
+        )
+        ctx = _make_ctx({"testpg": pg})
+        result = await explain_query("SELECT typo FROM users", "testpg", ctx)
+        assert "does not exist" in result
+        assert "describe_table" in result
+
+
+# ---------------------------------------------------------------------------
+# MySQL / MariaDB tool paths
+# ---------------------------------------------------------------------------
+
+
+class TestQueryMysql:
+    """Tests for query_mysql tool — mirrors TestQueryPostgres parity."""
+
+    async def test_valid_select(self) -> None:
+        my = _make_mysql_backend()
+        ctx = _make_ctx({"testmysql": my})
+        result = await query_mysql("SELECT * FROM users", ctx)
+        assert "| id | name |" in result
+        assert "| 1 | Alice |" in result
+        my.execute.assert_called_once_with("SELECT * FROM users")
+
+    async def test_write_query_rejected(self) -> None:
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await query_mysql("DROP TABLE users", ctx)
+        assert "Error:" in result
+
+    async def test_show_tables_rejected_with_hint(self) -> None:
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await query_mysql("SHOW TABLES", ctx)
+        assert "Error:" in result
+        assert "list_tables" in result
+
+    async def test_backtick_identifiers_accepted(self) -> None:
+        my = _make_mysql_backend()
+        ctx = _make_ctx({"testmysql": my})
+        result = await query_mysql("SELECT `id`, `name` FROM `users`", ctx)
+        assert "Error" not in result
+
+    async def test_no_mysql_configured(self) -> None:
+        # Only a postgres backend — query_mysql should fail to find one
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await query_mysql("SELECT 1", ctx)
+        assert "Error:" in result
+        assert "No mysql database configured" in result
+
+    async def test_json_output(self) -> None:
+        import json as _json
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await query_mysql("SELECT * FROM users", ctx, output_format="json")
+        data = _json.loads(result)
+        assert data["columns"] == ["id", "name"]
+        assert data["rows"] == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+
+class TestQueryMariadb:
+    """Tests for query_mariadb tool."""
+
+    async def test_valid_select(self) -> None:
+        md = _make_mysql_backend(name="testmariadb", db_type="mariadb")
+        ctx = _make_ctx({"testmariadb": md})
+        result = await query_mariadb("SELECT * FROM users", ctx)
+        assert "| id | name |" in result
+
+    async def test_routes_to_mariadb_backend_only(self) -> None:
+        """query_mariadb must NOT pick a mysql backend if no mariadb is configured.
+        This is important because the timeout SQL differs between flavors."""
+        mysql_backend = _make_mysql_backend(name="just_mysql", db_type="mysql")
+        ctx = _make_ctx({"just_mysql": mysql_backend})
+        result = await query_mariadb("SELECT 1", ctx)
+        assert "Error:" in result
+        assert "No mariadb database configured" in result
+
+    async def test_analyze_select_rejected(self) -> None:
+        """MariaDB's ANALYZE SELECT executes the inner query — must be rejected
+        by the validator."""
+        ctx = _make_ctx({"testmariadb": _make_mysql_backend(db_type="mariadb")})
+        result = await query_mariadb("ANALYZE SELECT * FROM users", ctx)
+        assert "Error:" in result
+
+    async def test_mixed_mysql_and_mariadb(self) -> None:
+        """With both configured, each tool should find its own backend."""
+        mysql = _make_mysql_backend(name="m1", db_type="mysql")
+        mariadb = _make_mysql_backend(name="m2", db_type="mariadb")
+        ctx = _make_ctx({"m1": mysql, "m2": mariadb})
+
+        await query_mysql("SELECT 1", ctx, database="m1")
+        mysql.execute.assert_called_once()
+        mariadb.execute.assert_not_called()
+
+        await query_mariadb("SELECT 1", ctx, database="m2")
+        mariadb.execute.assert_called_once()
+
+
+class TestCrossTypeRouting:
+    """Explicit `database=` must not cross flavor boundaries.
+
+    Before the type-enforcement fix, a caller could pass a postgres connection
+    name to query_mariadb and the tool would happily run MariaDB-flavored
+    timeout SQL against a PostgreSQL backend. These tests lock in the fix:
+    when db_type and name are both given and the named backend is a different
+    type, the tool errors with a message that points at the correct tool
+    instead of silently misrouting.
+    """
+
+    async def test_query_mariadb_rejects_mysql_connection_name(self) -> None:
+        mysql = _make_mysql_backend(name="prod_mysql", db_type="mysql")
+        mariadb = _make_mysql_backend(name="prod_mariadb", db_type="mariadb")
+        ctx = _make_ctx({"prod_mysql": mysql, "prod_mariadb": mariadb})
+
+        result = await query_mariadb("SELECT 1", ctx, database="prod_mysql")
+        assert "Error:" in result
+        assert "'prod_mysql' is a mysql connection, not mariadb" in result
+        # Points the AI at the correct tool
+        assert "query_mysql" in result
+        # Neither backend should have been asked to execute anything
+        mysql.execute.assert_not_called()
+        mariadb.execute.assert_not_called()
+
+    async def test_query_mysql_rejects_mariadb_connection_name(self) -> None:
+        mysql = _make_mysql_backend(name="prod_mysql", db_type="mysql")
+        mariadb = _make_mysql_backend(name="prod_mariadb", db_type="mariadb")
+        ctx = _make_ctx({"prod_mysql": mysql, "prod_mariadb": mariadb})
+
+        result = await query_mysql("SELECT 1", ctx, database="prod_mariadb")
+        assert "Error:" in result
+        assert "'prod_mariadb' is a mariadb connection, not mysql" in result
+        assert "query_mariadb" in result
+
+    async def test_query_postgres_rejects_clickhouse_connection_name(self) -> None:
+        pg = _make_pg_backend(name="pg1")
+        ch = _make_ch_backend(name="ch1")
+        ctx = _make_ctx({"pg1": pg, "ch1": ch})
+
+        result = await query_postgres("SELECT 1", ctx, database="ch1")
+        assert "Error:" in result
+        assert "'ch1' is a clickhouse connection, not postgres" in result
+        assert "query_clickhouse" in result
+
+    async def test_query_clickhouse_rejects_mysql_connection_name(self) -> None:
+        ch = _make_ch_backend(name="ch1")
+        mysql = _make_mysql_backend(name="mysql1", db_type="mysql")
+        ctx = _make_ctx({"ch1": ch, "mysql1": mysql})
+
+        result = await query_clickhouse("SELECT 1", ctx, database="mysql1")
+        assert "Error:" in result
+        assert "'mysql1' is a mysql connection, not clickhouse" in result
+
+    async def test_shared_tools_still_accept_any_type_by_name(self) -> None:
+        """list_tables / describe_table / sample_table / explain_query do
+        NOT pass db_type to _get_backend — they dispatch on whatever the named
+        connection happens to be. Verify the enforcement doesn't over-fire
+        and break these shared tools."""
+        mysql = _make_mysql_backend(name="any_backend", db_type="mysql")
+        ctx = _make_ctx({"any_backend": mysql})
+
+        # All of these should work against the mysql backend without error
+        result = await list_tables("any_backend", ctx)
+        assert "Error" not in result
+        result = await describe_table("any_backend", "users", ctx)
+        assert "Error" not in result
+
+
+class TestMysqlSharedTools:
+    """list_tables / describe_table / sample_table / explain_query should work
+    against MySQL and MariaDB backends too, since those tools dispatch by name
+    rather than hardcoding a type."""
+
+    async def test_list_tables_mysql(self) -> None:
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await list_tables("testmysql", ctx)
+        assert "users" in result
+        assert "orders" in result
+
+    async def test_describe_table_mysql(self) -> None:
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await describe_table("testmysql", "users", ctx)
+        assert "| id | int unsigned | NO |" in result
+        assert "| name | varchar(255) | YES |" in result
+
+    async def test_describe_table_mysql_with_stats(self) -> None:
+        my = _make_mysql_backend()
+        my.table_stats = AsyncMock(
+            return_value={
+                "engine": "InnoDB",
+                "table_rows_estimate": 12345,
+                "primary_key": "id",
+                "create_time": None,
+                "update_time": None,
+            }
+        )
+        ctx = _make_ctx({"testmysql": my})
+        result = await describe_table("testmysql", "users", ctx)
+        assert "**Table metadata:**" in result
+        assert "engine: InnoDB" in result
+        # The "_estimate" suffix is part of the contract — it tells the AI the
+        # row count from information_schema is not reliable for InnoDB.
+        assert "table_rows_estimate: 12345" in result
+
+    async def test_sample_table_mysql(self) -> None:
+        my = _make_mysql_backend()
+        ctx = _make_ctx({"testmysql": my})
+        result = await sample_table("testmysql", "users", ctx, n=3)
+        my.execute.assert_called_once()
+        sent_sql = my.execute.call_args[0][0]
+        assert "SELECT * FROM users LIMIT 3" == sent_sql
+        assert "| id | name |" in result
+
+    async def test_explain_query_mysql(self) -> None:
+        my = _make_mysql_backend()
+        ctx = _make_ctx({"testmysql": my})
+        result = await explain_query("SELECT * FROM users", "testmysql", ctx)
+        assert "select_type: SIMPLE" in result
+        my.explain.assert_called_once()
+
+    async def test_explain_query_rejects_write_mysql(self) -> None:
+        """EXPLAIN ANALYZE DELETE would execute the DELETE in MySQL 8.0.18+.
+        The validator must reject the write before it reaches backend.explain."""
+        ctx = _make_ctx({"testmysql": _make_mysql_backend()})
+        result = await explain_query("DELETE FROM users", "testmysql", ctx)
+        assert "Error:" in result
+
+    async def test_list_databases_shows_flavor(self) -> None:
+        """list_databases should label mysql and mariadb connections distinctly."""
+        ctx = _make_ctx({
+            "pg": _make_pg_backend(),
+            "ch": _make_ch_backend(),
+            "my": _make_mysql_backend(name="my", db_type="mysql"),
+            "md": _make_mysql_backend(name="md", db_type="mariadb"),
+        })
+        result = await list_databases(ctx)
+        assert "(mysql)" in result
+        assert "(mariadb)" in result
+
+
+class TestUsageGuideMysql:
+    """usage_guide should mention MySQL and MariaDB tools."""
+
+    async def test_guide_mentions_mysql_tools(self) -> None:
+        ctx = _make_ctx({
+            "my": _make_mysql_backend(name="my", db_type="mysql"),
+            "md": _make_mysql_backend(name="md", db_type="mariadb"),
+        })
+        result = await usage_guide(ctx)
+        assert "query_mysql" in result
+        assert "query_mariadb" in result
+        # Connections block should show both flavors
+        assert "my" in result
+        assert "md" in result

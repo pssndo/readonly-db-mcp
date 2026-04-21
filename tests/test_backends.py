@@ -12,7 +12,14 @@ from readonly_db_mcp.databases.clickhouse import (
     ClickHouseBackend,
     _is_retriable_connection_error,
 )
-from readonly_db_mcp.config import PostgresConnection, ClickHouseConnection, Config
+from readonly_db_mcp.databases.mysql import MariaDBBackend, MySQLBackend
+from readonly_db_mcp.config import (
+    PostgresConnection,
+    ClickHouseConnection,
+    MysqlConnection,
+    MariaDBConnection,
+    Config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +195,106 @@ class TestClickHouseRetryClassification:
     def test_max_execution_time_is_not_retriable(self) -> None:
         error = RuntimeError("DB::Exception: max_execution_time exceeded")
         assert not _is_retriable_connection_error(error)
+
+
+# ---------------------------------------------------------------------------
+# MySQLBackend — constructor and flavor-specific behavior (no real DB needed)
+# ---------------------------------------------------------------------------
+
+
+class TestMySQLBackendUnit:
+    """Unit tests for MySQLBackend / MariaDBBackend (no real DB needed).
+
+    MySQL and MariaDB share an implementation via a common base class
+    (`_MySQLFamilyBackend`), but each concrete subclass declares its own
+    class-level `db_type` attribute — matching the PG/CH pattern. The
+    `db_type` drives timeout-SQL selection at runtime, so the two behaviors
+    are pinned at class level rather than passed as a parameter.
+    """
+
+    def _make_mysql_config(self, **overrides) -> MysqlConnection:
+        defaults = {
+            "name": "test_mysql",
+            "host": "localhost",
+            "port": 3306,
+            "database": "testdb",
+            "user": "reader",
+            "password": "secret",
+        }
+        defaults.update(overrides)
+        return MysqlConnection(**defaults)
+
+    def _make_mariadb_config(self, **overrides) -> MariaDBConnection:
+        defaults = {
+            "name": "test_mariadb",
+            "host": "localhost",
+            "port": 3306,
+            "database": "testdb",
+            "user": "reader",
+            "password": "secret",
+        }
+        defaults.update(overrides)
+        return MariaDBConnection(**defaults)
+
+    def test_ensure_connected_raises_before_connect(self) -> None:
+        backend = MySQLBackend(self._make_mysql_config())
+        with pytest.raises(RuntimeError, match="Not connected"):
+            backend._ensure_connected()
+
+    def test_mysql_db_type_is_class_level(self) -> None:
+        # db_type is declared on the class itself — matches postgres.py /
+        # clickhouse.py pattern, no per-instance shadowing.
+        assert MySQLBackend.db_type == "mysql"
+        backend = MySQLBackend(self._make_mysql_config())
+        assert backend.db_type == "mysql"
+
+    def test_mariadb_db_type_is_class_level(self) -> None:
+        assert MariaDBBackend.db_type == "mariadb"
+        backend = MariaDBBackend(self._make_mariadb_config())
+        assert backend.db_type == "mariadb"
+
+    def test_mysql_timeout_prelude_uses_max_execution_time_in_ms(self) -> None:
+        """MySQL's max_execution_time is in milliseconds (SELECT-only scope)."""
+        config = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=30, max_result_rows=1000,
+        )
+        backend = MySQLBackend(self._make_mysql_config(), config)
+        prelude = backend._timeout_prelude_sql()
+        assert "max_execution_time" in prelude
+        assert "30000" in prelude  # 30 seconds * 1000 = 30000 ms
+        # Don't leak the MariaDB variant
+        assert "max_statement_time" not in prelude
+
+    def test_mariadb_timeout_prelude_uses_max_statement_time_in_seconds(self) -> None:
+        """MariaDB's max_statement_time is in seconds (applies to all statements)."""
+        config = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=30, max_result_rows=1000,
+        )
+        backend = MariaDBBackend(self._make_mariadb_config(), config)
+        prelude = backend._timeout_prelude_sql()
+        assert "max_statement_time" in prelude
+        assert " = 30" in prelude  # 30 seconds, not ms
+        # Don't leak the MySQL variant
+        assert "max_execution_time" not in prelude
+
+    def test_constructor_stores_config(self) -> None:
+        config = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=60, max_result_rows=500,
+        )
+        backend = MySQLBackend(self._make_mysql_config(), config)
+        assert backend._timeout == 60
+        assert backend._max_rows == 500
+        assert backend.host == "localhost"
+        assert backend.database == "testdb"
+        assert backend.name == "test_mysql"
+
+    def test_constructor_defaults_without_config(self) -> None:
+        backend = MySQLBackend(self._make_mysql_config())
+        assert backend._timeout == 30
+        assert backend._max_rows == 1000
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # readonly-db-mcp Architecture
 
-This document describes the architecture, design decisions, and implementation details of readonly-db-mcp — a production-grade MCP server that provides safe, read-only SQL access to PostgreSQL and ClickHouse databases for AI agents.
+This document describes the architecture, design decisions, and implementation details of readonly-db-mcp — a production-grade MCP server that provides safe, read-only SQL access to PostgreSQL, ClickHouse, MySQL, and MariaDB databases for AI agents.
 
 **For user-facing documentation**, see [README.md](README.md).
 
@@ -8,7 +8,7 @@ This document describes the architecture, design decisions, and implementation d
 
 ## Overview
 
-readonly-db-mcp is a pip-installable MCP server that gives AI agents (Claude Code, Cursor, etc.) safe, **read-only** SQL access to PostgreSQL and ClickHouse databases. Three independent layers of write protection ensure that even a compromised or malicious AI agent cannot modify production data.
+readonly-db-mcp is a pip-installable MCP server that gives AI agents (Claude Code, Cursor, etc.) safe, **read-only** SQL access to PostgreSQL, ClickHouse, MySQL, and MariaDB databases. Three independent layers of write protection ensure that even a compromised or malicious AI agent cannot modify production data.
 
 **Design priorities:**
 - **Security first**: Three-layer defense-in-depth architecture
@@ -30,33 +30,37 @@ Claude Code / AI Agent
 |                           |
 |  1. sqlglot validation    |  <-- parse SQL AST, reject non-SELECT
 |  2. connection pool       |  <-- asyncpg (PG) / clickhouse-connect (CH)
+|                           |      asyncmy (MySQL + MariaDB)
 |  3. read-only transaction |  <-- belt-and-suspenders enforcement
 |  4. result formatting     |  <-- markdown tables for the AI
 +---------------------------+
         |
         | SQL (read-only user)
         v
-  PostgreSQL    ClickHouse
+  PostgreSQL    ClickHouse    MySQL    MariaDB
 ```
 
 ### Three Layers of Write Protection
 
 1. **sqlglot AST validation** -- whitelist approach: root node must be SELECT-family, full tree walk rejects any write node hidden in CTEs/subqueries
-2. **Connection-level settings** -- `default_transaction_read_only=on` (PG), `readonly=1` (CH)
+2. **Connection-level settings** -- `default_transaction_read_only=on` (PG), `readonly=1` (CH), `SET SESSION TRANSACTION READ ONLY` + per-query `START TRANSACTION READ ONLY` (MySQL/MariaDB)
 3. **DB user permissions** -- dedicated users with only `GRANT SELECT` (set up by the operator, not this tool)
+
+**MySQL/MariaDB caveat for Layer 2:** unlike PostgreSQL, MySQL and MariaDB have no server-side per-connection "default transaction read-only" flag. We approximate it by running `SET SESSION TRANSACTION READ ONLY` at connection init (via asyncmy's `init_command`) and wrapping every query in `START TRANSACTION READ ONLY` / `COMMIT`. This is slightly weaker than the PG mechanism because a hypothetical query that bypassed our transaction wrapping could toggle the session back to READ WRITE — but Layer 1 (sqlglot) rejects `SET` statements at parse time, so this gap only matters if Layer 1 were already compromised. **Layer 3 (GRANT SELECT only) is the authoritative backstop for MySQL/MariaDB** and must not be skipped.
 
 ---
 
 ## Tech Stack
 
-| Component         | Package                     | Version | Why                                                        |
-| ----------------- | --------------------------- | ------- | ---------------------------------------------------------- |
-| MCP framework     | `mcp`                       | >=1.2.0 | Official Python SDK with FastMCP                           |
-| SQL parsing       | `sqlglot`                   | >=26.0  | 31 SQL dialects (PG + CH), zero deps, AST-level inspection |
-| PostgreSQL driver | `asyncpg`                   | >=0.29  | Fast async driver, native read-only transaction support    |
-| ClickHouse driver | `clickhouse-connect`        | >=0.7   | Official ClickHouse Python client                          |
-| Config            | `python-dotenv`             | >=1.0   | Env var / .env parsing (simple, no validation overhead)    |
-| Testing           | `pytest` + `pytest-asyncio` | latest  | Async test support                                         |
+| Component             | Package                     | Version | Why                                                           |
+| --------------------- | --------------------------- | ------- | ------------------------------------------------------------- |
+| MCP framework         | `mcp`                       | >=1.2.0 | Official Python SDK with FastMCP                              |
+| SQL parsing           | `sqlglot`                   | >=26.0  | Supports `postgres`, `clickhouse`, `mysql` dialects (MariaDB covered by mysql) |
+| PostgreSQL driver     | `asyncpg`                   | >=0.29  | Fast async driver, native read-only transaction support       |
+| ClickHouse driver     | `clickhouse-connect`        | >=0.7   | Official ClickHouse Python client                             |
+| MySQL/MariaDB driver  | `asyncmy`                   | >=0.2.9 | Native-async Cython driver (aiomysql-compatible API). One driver serves both. |
+| Config                | `python-dotenv`             | >=1.0   | Env var / .env parsing (simple, no validation overhead)       |
+| Testing               | `pytest` + `pytest-asyncio` | latest  | Async test support                                            |
 
 Python >=3.11 required.
 
@@ -82,6 +86,7 @@ readonly-db-mcp/
         base.py               # Abstract DatabaseBackend + shared utilities
         postgres.py           # asyncpg pool, read-only transactions, health checks
         clickhouse.py         # clickhouse-connect client, readonly=1, reconnection
+        mysql.py              # asyncmy pool, SESSION READ ONLY + per-query START TRANSACTION READ ONLY; serves both MySQL and MariaDB
   tests/
     test_validation.py        # SQL validation tests (security-critical)
     test_config.py            # Config parsing tests
@@ -112,6 +117,24 @@ CH_1_PORT=8123
 CH_1_DATABASE=events
 CH_1_USER=ai_reader
 CH_1_PASSWORD=secret
+
+# MySQL connections (MYSQL_1_, MYSQL_2_, etc.)
+MYSQL_1_NAME=primary_mysql
+MYSQL_1_HOST=mysql-prod.internal
+MYSQL_1_PORT=3306
+MYSQL_1_DATABASE=myapp
+MYSQL_1_USER=ai_reader
+MYSQL_1_PASSWORD=secret
+
+# MariaDB connections (MARIADB_1_, MARIADB_2_, etc.)
+# Separate prefix from MySQL — same wire protocol, but distinct at the
+# config layer so operators can be explicit about what they're targeting.
+MARIADB_1_NAME=legacy
+MARIADB_1_HOST=mariadb-prod.internal
+MARIADB_1_PORT=3306
+MARIADB_1_DATABASE=legacy_app
+MARIADB_1_USER=ai_reader
+MARIADB_1_PASSWORD=secret
 
 # Global settings
 QUERY_TIMEOUT_SECONDS=30       # Per-query timeout
@@ -158,7 +181,7 @@ Claude Code auto-discovers the tools. No further setup.
 
 ## MCP Tools
 
-Eight tools are exposed to the AI. Dedicated tools should be preferred over raw SQL where available — they're cheaper, clearer, and don't hit the "SELECT-only" rejection path.
+Ten tools are exposed to the AI. Dedicated tools should be preferred over raw SQL where available — they're cheaper, clearer, and don't hit the "SELECT-only" rejection path.
 
 ### 1. `query_postgres`
 
@@ -184,7 +207,31 @@ Execute a read-only SQL query against ClickHouse.
 
 Returns: results rendered in the requested format.
 
-### 3. `list_databases`
+### 3. `query_mysql`
+
+Execute a read-only SQL query against MySQL.
+
+| Parameter       | Type   | Required | Description                                                     |
+| --------------- | ------ | -------- | --------------------------------------------------------------- |
+| `sql`           | string | yes      | The SQL query                                                   |
+| `database`      | string | no       | Named MySQL **connection** (default: first configured)          |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`                 |
+
+Returns: results rendered in the requested format. Safety note: MySQL 8.0.18+ `EXPLAIN ANALYZE` executes the inner query, same as PostgreSQL — `explain_query` validates the inner SQL as read-only first, but raw `EXPLAIN ANALYZE ...` sent via `query_mysql` is rejected by the validator.
+
+### 4. `query_mariadb`
+
+Execute a read-only SQL query against MariaDB.
+
+| Parameter       | Type   | Required | Description                                                     |
+| --------------- | ------ | -------- | --------------------------------------------------------------- |
+| `sql`           | string | yes      | The SQL query                                                   |
+| `database`      | string | no       | Named MariaDB **connection** (default: first configured)        |
+| `output_format` | string | no       | `"table"` (default) \| `"vertical"` \| `"json"`                 |
+
+Returns: results rendered in the requested format. Separate tool from `query_mysql` because MariaDB has distinct timeout semantics (`max_statement_time` in seconds, vs MySQL's `max_execution_time` in ms) and operator-facing config (`MARIADB_N_*` prefix). Shares the MySQL wire protocol and sqlglot parser.
+
+### 5. `list_databases`
 
 List all configured database connections.
 
@@ -194,17 +241,18 @@ List all configured database connections.
 
 Returns: list of `{name, type, host, database}`. The `name` is what you pass as `database=...` to other tools — it's an alias, **not** a PG schema or CH database.
 
-### 4. `list_tables`
+### 6. `list_tables`
 
 List tables in a database.
 
-| Parameter  | Type   | Required | Description      |
-| ---------- | ------ | -------- | ---------------- |
-| `database` | string | yes      | Connection name  |
+| Parameter  | Type   | Required | Description                                                  |
+| ---------- | ------ | -------- | ------------------------------------------------------------ |
+| `database` | string | yes      | Connection name                                              |
+| `schema`   | string | no       | Restrict to a specific schema/database within the connection |
 
-Returns: list of table names (with schema for PG; in the connection's default schema only for CH).
+Returns: list of table names. When `schema` is omitted, each backend uses its natural default (all non-system schemas for PG; the connection's configured database for CH/MySQL/MariaDB). When `schema` is provided, the backend scopes its metadata query to that schema via a parameterized SELECT against `pg_tables` / `system.tables` / `information_schema.tables` — no string interpolation. PostgreSQL still returns `schema.table` format regardless, so the output shape is uniform.
 
-### 5. `describe_table`
+### 7. `describe_table`
 
 Show columns, types, and nullability for a table. For ClickHouse, also returns engine, total_rows, total_bytes, primary_key, sorting_key, and partition_key (read from `system.tables`, silently skipped if the user lacks that grant).
 
@@ -215,7 +263,7 @@ Show columns, types, and nullability for a table. For ClickHouse, also returns e
 
 Returns: markdown table of column definitions, plus an optional metadata section.
 
-### 6. `sample_table`
+### 8. `sample_table`
 
 Return the first N rows of a table — the "give me a peek" shortcut.
 
@@ -228,7 +276,7 @@ Return the first N rows of a table — the "give me a peek" shortcut.
 
 Internally issues `SELECT * FROM <safe_table> LIMIT <n>` through the same validation path as `query_*`. Table names are validated against the safe-identifier regex before interpolation.
 
-### 7. `explain_query`
+### 9. `explain_query`
 
 Show the query execution plan.
 
@@ -236,11 +284,13 @@ Show the query execution plan.
 | ---------- | ------- | -------- | ------------------------------------------------------------ |
 | `sql`      | string  | yes      | The SELECT query to explain (validated as read-only first)   |
 | `database` | string  | yes      | Connection name                                              |
-| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (PG only; ignored for CH, default false) |
+| `analyze`  | boolean | no       | Run EXPLAIN ANALYZE (PG only; ignored for CH / MySQL / MariaDB, default false) |
 
-Returns: query plan as text. The inner SQL is validated as read-only *before* EXPLAIN is prepended, which blocks the `EXPLAIN ANALYZE DELETE ...` bypass in PostgreSQL.
+Returns: query plan as text. The inner SQL is validated as read-only *before* EXPLAIN is prepended, which blocks the `EXPLAIN ANALYZE DELETE ...` bypass in PostgreSQL and MySQL 8.0.18+.
 
-### 8. `usage_guide`
+**Why `analyze=true` is ignored for MySQL/MariaDB:** MySQL 8.0.18+ `EXPLAIN ANALYZE` and MariaDB's `ANALYZE <stmt>` both execute the inner query (like PostgreSQL's EXPLAIN ANALYZE). Although the inner SQL is already validated as read-only so DELETE/UPDATE cannot slip through, we take a conservative stance: the MySQL/MariaDB backends run plain `EXPLAIN` regardless of the flag (strictly plan-only, no execution) and append a note to the output when the flag was set. Keep MySQL plan analysis at the SQL layer (`SELECT * FROM information_schema.statistics WHERE ...`) if deeper timing is needed.
+
+### 10. `usage_guide`
 
 Return a cheatsheet describing all tools, typical workflows, output formats, and schema-qualification rules. Use when unsure which tool to reach for.
 
@@ -469,10 +519,12 @@ async def list_databases(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def list_tables(database: str, ctx: Context) -> str:
-    """List all tables in a configured database."""
+async def list_tables(database: str, ctx: Context, schema: str | None = None) -> str:
+    """List all tables in a configured database (optionally scoped to a schema)."""
     backend = _get_backend(ctx, database)
-    tables = await backend.list_tables()
+    if schema is not None:
+        validate_identifier(schema)
+    tables = await backend.list_tables(schema=schema)
     return "\n".join(f"- {t}" for t in tables) if tables else "No tables found."
 
 
@@ -531,7 +583,7 @@ class DatabaseBackend(ABC):
         ...
 
     @abstractmethod
-    async def list_tables(self) -> list[str]: ...
+    async def list_tables(self, schema: str | None = None) -> list[str]: ...
 
     @abstractmethod
     async def describe_table(self, table: str) -> list[dict]: ...
@@ -843,6 +895,32 @@ Instead, the validator produces a pointed error message when it detects one
 of these commands as the root, suggesting the correct dedicated tool. This
 preserves the whitelist security model while closing the discoverability gap.
 
+### Why separate `MYSQL_` and `MARIADB_` prefixes if the backend class is shared?
+
+MariaDB forked from MySQL and is wire-protocol-compatible — one driver (`asyncmy`) handles both, and sqlglot's `mysql` dialect parses both for SELECT-shape validation. Mechanically, a single config + backend would suffice.
+
+We keep them separate at the config layer because:
+
+1. **Explicitness at operator config time.** "Is this MySQL or MariaDB?" affects timeout semantics (`max_execution_time` in ms for MySQL vs `max_statement_time` in seconds for MariaDB), SHOW statement variants, and some recovery commands. Making operators opt in explicitly avoids the "works until it doesn't" class of bugs when timeout behavior silently differs.
+2. **Distinct labels in `list_databases`.** AIs get a clearer picture of the environment when `prod_mysql (mysql)` and `legacy (mariadb)` are visibly separate.
+3. **Per-flavor tool paths.** `query_mysql` and `query_mariadb` are distinct tools. Route-by-flavor at the tool layer lets us tighten each independently in the future (e.g., adding MariaDB-specific `table_stats` fields from `information_schema.INNODB_SYS_TABLESTATS`).
+
+The two backends share an implementation (`_MySQLFamilyBackend` base class) but are exposed as distinct concrete classes (`MySQLBackend`, `MariaDBBackend`), each with its own class-level `db_type` attribute. This matches the pattern in `postgres.py` and `clickhouse.py` (each of those also declares `db_type` at class scope) and means `_get_backend`'s type check sees a real class-level value rather than a per-instance attribute shadow. The shared base class carries the asyncmy pool management, transaction wrapping, identifier validation, and `information_schema` queries; the subclasses only override `db_type`, and the timeout-prelude branches on `self.db_type` at runtime.
+
+### Why per-query `START TRANSACTION READ ONLY` on MySQL/MariaDB instead of trusting the session flag?
+
+MySQL's session-level `SET SESSION TRANSACTION READ ONLY` (which we set via asyncmy's `init_command`) applies to all subsequent transactions, but a pooled connection could in theory be asked to toggle it back to READ WRITE mid-session. Wrapping each query in its own explicit `START TRANSACTION READ ONLY` / `COMMIT` means:
+
+- Every query runs inside a named read-only transaction — no ambiguity
+- The connection returns to the pool in a clean state (no long-running implicit transactions holding locks)
+- Same mental model as the PostgreSQL backend's `conn.transaction(readonly=True)` wrapping
+
+The COMMIT at the end is a no-op on the server for read-only transactions, so the overhead is small.
+
+### Why MySQL/MariaDB `EXPLAIN ANALYZE` is not exposed even with `analyze=True`?
+
+MySQL 8.0.18+ and MariaDB's `ANALYZE <stmt>` both execute the inner query. For PostgreSQL we accept this because the outer read-only transaction blocks any write side effects (EXPLAIN ANALYZE can time a DELETE inside a read-only transaction, which is a rollback). For MySQL/MariaDB we take a stricter stance and always run plain `EXPLAIN` — even though our outer read-only transaction would also roll back any writes, the extra defense-in-depth here costs nothing (you can still read the execution plan) and removes any chance that a future MySQL bug, a misconfigured connection, or a stored procedure with `SECURITY DEFINER` privileges lets an ANALYZE-time side effect commit.
+
 ### Why asyncpg for PostgreSQL but not an async ClickHouse client?
 
 asyncpg is a mature, battle-tested async PostgreSQL driver with connection pooling and health checks built-in. ClickHouse's official Python client (`clickhouse-connect`) is synchronous and uses HTTP under the hood (no persistent connections). We wrap all `clickhouse-connect` calls in `asyncio.to_thread()` to avoid blocking the event loop. This is pragmatic — the overhead is acceptable, and the alternative (using an unofficial async client) introduces more risk.
@@ -900,6 +978,28 @@ CREATE USER ai_reader IDENTIFIED BY 'strong_password_here'
     SETTINGS PROFILE 'readonly';
 GRANT SELECT ON mydb.* TO ai_reader;
 ```
+
+### MySQL
+
+```sql
+CREATE USER 'ai_reader'@'%' IDENTIFIED BY 'strong_password_here';
+GRANT SELECT ON myapp.* TO 'ai_reader'@'%';
+-- information_schema is globally readable for the user's own objects by default;
+-- no extra grant needed for describe_table / list_tables metadata queries.
+```
+
+Note: do **not** grant `SHOW VIEW`, `EXECUTE`, `TRIGGER`, or any DML privileges. The AI never needs these, and granting `EXECUTE` on stored functions is especially risky because `SELECT my_write_function()` parses as a pure SELECT but can perform writes via function body.
+
+`FLUSH PRIVILEGES` is deliberately omitted. It's only needed when you modify the `mysql.user` table directly (e.g., `UPDATE mysql.user SET ...`). `CREATE USER` and `GRANT` update the in-memory privilege cache automatically on MySQL 5.7+ and MariaDB 10+, so the flush is a cargo-culted no-op here.
+
+### MariaDB
+
+```sql
+CREATE USER 'ai_reader'@'%' IDENTIFIED BY 'strong_password_here';
+GRANT SELECT ON legacy_app.* TO 'ai_reader'@'%';
+```
+
+Same privilege posture as MySQL. MariaDB's `SHOW GRANTS FOR 'ai_reader'@'%'` should show only `GRANT SELECT ON legacy_app.*` and `GRANT USAGE ON *.*` (USAGE is implicit connect).
 
 ---
 

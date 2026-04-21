@@ -144,8 +144,12 @@ class PostgresBackend(DatabaseBackend):
         truncated = [tuple(r.values()) for r in rows[: self._max_rows]]
         return columns, truncated, total
 
-    async def list_tables(self) -> list[str]:
-        """List all user tables in schema.table format, excluding PostgreSQL system schemas.
+    async def list_tables(self, schema: str | None = None) -> list[str]:
+        """List user tables in `schema.table` format, excluding PostgreSQL system schemas.
+
+        When `schema` is None, returns tables from every non-system schema.
+        When provided, returns only tables from that schema (still in
+        `schema.table` format so the output shape stays uniform).
 
         pg_catalog and information_schema contain PostgreSQL's internal tables
         which are not useful for the AI to query.
@@ -153,15 +157,30 @@ class PostgresBackend(DatabaseBackend):
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
             async with conn.transaction(readonly=True):
-                rows = await conn.fetch(
-                    """
-                    SELECT schemaname || '.' || tablename AS table_name
-                    FROM pg_tables
-                    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-                    ORDER BY schemaname, tablename
-                    """,
-                    timeout=self._timeout,
-                )
+                if schema is None:
+                    rows = await conn.fetch(
+                        """
+                        SELECT schemaname || '.' || tablename AS table_name
+                        FROM pg_tables
+                        WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                        ORDER BY schemaname, tablename
+                        """,
+                        timeout=self._timeout,
+                    )
+                else:
+                    # Parameterized query — asyncpg safely binds $1 server-side.
+                    # The validate_identifier check in the server tool is
+                    # defense-in-depth against accidental interpolation upstream.
+                    rows = await conn.fetch(
+                        """
+                        SELECT schemaname || '.' || tablename AS table_name
+                        FROM pg_tables
+                        WHERE schemaname = $1
+                        ORDER BY tablename
+                        """,
+                        schema,
+                        timeout=self._timeout,
+                    )
         return [r["table_name"] for r in rows]
 
     async def describe_table(self, table: str) -> list[dict]:
