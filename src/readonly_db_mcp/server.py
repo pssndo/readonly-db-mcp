@@ -252,6 +252,37 @@ def _safe_error_message(exc: Exception) -> str:
     return first_line
 
 
+# Substrings that signal a schema-level mistake (typo in a column name, missing
+# table, unknown identifier). If any of these appears in a driver's error
+# message, we append a hint pointing the AI at the dedicated discovery tools
+# instead of having it guess from the bare driver text. This is UX only — the
+# hint is suffixed to the already-forwarded driver message, never replaces it.
+_SCHEMA_ERROR_MARKERS = (
+    "unknown column",       # MySQL/MariaDB: Unknown column 'foo' in 'field list'
+    "unknown identifier",   # ClickHouse: Unknown identifier 'foo'
+    "unknown table",        # MySQL/MariaDB: Unknown table 'foo'
+    "does not exist",       # PostgreSQL: column "foo" does not exist / relation "foo" does not exist
+    "no such column",       # SQLite-style (future-proofing; some drivers use it)
+    "no such table",
+)
+
+
+def _schema_error_hint(err_msg: str) -> str:
+    """Return a hint suffix for schema-shaped errors, or empty string.
+
+    We match case-insensitively on common substrings emitted by the four
+    drivers. The hint never makes assumptions about which column or table —
+    it just points the AI at the tools it should have called first.
+    """
+    lowered = err_msg.lower()
+    if any(marker in lowered for marker in _SCHEMA_ERROR_MARKERS):
+        return (
+            " (common cause: column/table not found — call `describe_table` "
+            "to see actual column names, or `list_tables` to confirm the table exists)"
+        )
+    return ""
+
+
 def _validate_output_format(fmt: str) -> str:
     """Validate the output_format param and return it, or raise ValueError."""
     if fmt not in ("table", "vertical", "json"):
@@ -338,9 +369,12 @@ async def query_postgres(
         # Never expose stack traces. Do forward the driver's error message so
         # the AI can see *why* the query failed ("Unknown table", "syntax error
         # at position N", etc.) — this information is already visible to anyone
-        # who could send the query, so there's no new exposure.
+        # who could send the query, so there's no new exposure. On common
+        # schema-shaped errors, append a hint that points the AI at the tools
+        # it should have called first.
         logger.exception("query_postgres execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -368,6 +402,11 @@ async def query_clickhouse(
       sql:           The SQL query. Fully-qualify tables across schemas like
                      `develop_db.events` — the `database` param below picks
                      the *connection*, not the ClickHouse schema.
+                     ClickHouse identifiers (column/table names) are
+                     case-sensitive and often not what you'd guess
+                     (e.g. `datetime`, not `timestamp` or `ts`). Always run
+                     `describe_table` before writing queries against an
+                     unfamiliar table — guessing column names is costly here.
       database:      Connection name configured in env vars (e.g. "analytics").
                      This is the *connection name*, not a ClickHouse database.
                      Defaults to the first configured ClickHouse connection.
@@ -392,7 +431,8 @@ async def query_clickhouse(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("query_clickhouse execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -447,7 +487,8 @@ async def query_mysql(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("query_mysql execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -498,7 +539,8 @@ async def query_mariadb(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("query_mariadb execution failed")
-        return f"Error: query execution failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -527,37 +569,54 @@ async def list_databases(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def list_tables(database: str, ctx: Context) -> str:
+async def list_tables(database: str, ctx: Context, schema: str | None = None) -> str:
     """List all tables visible to the configured user in a database connection.
 
-    Per-backend details:
-      - PostgreSQL: results in `schema.table` format (system schemas like
-        pg_catalog and information_schema are excluded).
+    Per-backend default behavior (no `schema` given):
+      - PostgreSQL: results in `schema.table` format across all non-system
+        schemas (pg_catalog and information_schema are excluded).
       - ClickHouse: table names in the connection's default database only.
-        To see tables in other schemas, run
-        `SELECT name FROM system.tables WHERE database = 'other'`.
       - MySQL / MariaDB: table names in the connection's default database only
         (system schemas `mysql`, `information_schema`, `performance_schema`,
-        `sys` are excluded). To see tables in another database, run
-        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'other'`.
+        `sys` are excluded).
+
+    When `schema` is provided, listing is restricted to that schema. This is
+    the canonical way to discover tables in databases other than the
+    connection's default — you no longer have to write raw `SELECT` against
+    `system.tables` / `information_schema.tables` for this common case.
 
     Params:
       database: Connection name from `list_databases` (not a schema name).
+      schema:   Optional schema/database name to list tables from.
+                PG: a PostgreSQL schema (e.g. "public", "reporting").
+                CH: a ClickHouse database (e.g. "develop_db").
+                MySQL/MariaDB: a database name (e.g. "legacy_app").
 
     Next step: call `describe_table(database, table)` for columns and metadata,
     or `sample_table(database, table, n=5)` to see a few rows.
     """
     try:
         backend = _get_backend(ctx, database)
-        tables = await backend.list_tables()
+        # Validate the schema identifier before handing it to the backend.
+        # The backends parameterize it in their metadata queries (server-side
+        # binding), but defense-in-depth: reject obviously unsafe input here
+        # with a clear error message. validate_identifier allows dots, which
+        # is fine because PG's pg_tables.schemaname and CH's
+        # system.tables.database never contain dots in practice.
+        if schema is not None:
+            validate_identifier(schema)
+        tables = await backend.list_tables(schema=schema)
         if not tables:
+            if schema is not None:
+                return f"No tables found in schema {schema!r}."
             return "No tables found."
         return "\n".join(f"- {t}" for t in tables)
     except ValueError as e:
         return f"Error: {e}"
     except Exception as e:
         logger.exception("list_tables failed for '%s'", database)
-        return f"Error: failed to list tables: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: failed to list tables: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -576,9 +635,11 @@ async def describe_table(database: str, table: str, ctx: Context) -> str:
         partition_key (from system.tables; skipped silently if no grant)
       - MySQL / MariaDB: engine, table_rows_estimate, primary_key, create_time,
         update_time (from information_schema; skipped silently if no grant).
-        Note the "_estimate" suffix on table_rows: for InnoDB tables the row
-        count can be off by 40-50%. Use `SELECT COUNT(*) FROM <table>` for
-        exact counts.
+        The "_estimate" suffix on `table_rows` is literal: for InnoDB tables
+        the value is an optimizer-maintained estimate that can be anywhere
+        from a few percent off to 40-50% off (sometimes reports 0 for small
+        tables). Treat it as an order-of-magnitude signal, not a count.
+        For an exact count, run `SELECT COUNT(*) FROM <table>`.
 
     Params:
       database: Connection name from `list_databases`.
@@ -674,7 +735,8 @@ async def sample_table(
         return f"Error: {e}"
     except Exception as e:
         logger.exception("sample_table failed for '%s.%s'", database, table)
-        return f"Error: sample_table failed: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: sample_table failed: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -716,7 +778,8 @@ async def explain_query(sql: str, database: str, ctx: Context, analyze: bool = F
         return f"Error: {e}"
     except Exception as e:
         logger.exception("explain_query failed for '%s'", database)
-        return f"Error: failed to explain query: {_safe_error_message(e)}"
+        msg = _safe_error_message(e)
+        return f"Error: failed to explain query: {msg}{_schema_error_hint(msg)}"
 
 
 @mcp.tool()
@@ -775,7 +838,11 @@ The `database` param picks the *connection*, not the schema. Fully qualify
 tables that live outside the connection's default schema:
   `SELECT * FROM develop_db.events LIMIT 10`
 To list tables in a different schema:
-  `SELECT name FROM system.tables WHERE database = 'develop_db'`
+  `list_tables(database="analytics", schema="develop_db")`
+
+ClickHouse identifiers are **case-sensitive** and often unexpected
+(`datetime`, not `ts` or `timestamp`; `eventType`, not `event_type`). Always
+`describe_table` before querying an unfamiliar table — you will guess wrong.
 
 ## MySQL / MariaDB schemas
 Same idea as ClickHouse: `database=` is the connection alias, not a MySQL
@@ -784,9 +851,15 @@ unqualified table names resolve against it. To query another database on
 the same connection, qualify explicitly:
   `SELECT * FROM other_db.orders LIMIT 10`
 To list tables in another database:
-  `SELECT table_name FROM information_schema.tables WHERE table_schema = 'other_db'`
+  `list_tables(database="prod_mysql", schema="other_db")`
 Note: the configured read-only user must have SELECT on the target database
 for the query to succeed.
+
+On MySQL/MariaDB, `describe_table` returns `table_rows_estimate` rather than
+an exact row count. For InnoDB tables this is an optimizer-maintained
+*estimate* that can be off by tens of percent (sometimes 40-50%), and
+sometimes reports 0 for small tables. If you need an accurate count run
+`SELECT COUNT(*) FROM <table>` explicitly.
 
 ## MySQL vs MariaDB tool choice
 Use `query_mysql` for MySQL connections (configured via `MYSQL_N_*` env vars)

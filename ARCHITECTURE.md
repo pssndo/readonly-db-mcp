@@ -245,11 +245,12 @@ Returns: list of `{name, type, host, database}`. The `name` is what you pass as 
 
 List tables in a database.
 
-| Parameter  | Type   | Required | Description      |
-| ---------- | ------ | -------- | ---------------- |
-| `database` | string | yes      | Connection name  |
+| Parameter  | Type   | Required | Description                                                  |
+| ---------- | ------ | -------- | ------------------------------------------------------------ |
+| `database` | string | yes      | Connection name                                              |
+| `schema`   | string | no       | Restrict to a specific schema/database within the connection |
 
-Returns: list of table names (with schema for PG; in the connection's default schema only for CH).
+Returns: list of table names. When `schema` is omitted, each backend uses its natural default (all non-system schemas for PG; the connection's configured database for CH/MySQL/MariaDB). When `schema` is provided, the backend scopes its metadata query to that schema via a parameterized SELECT against `pg_tables` / `system.tables` / `information_schema.tables` — no string interpolation. PostgreSQL still returns `schema.table` format regardless, so the output shape is uniform.
 
 ### 7. `describe_table`
 
@@ -518,10 +519,12 @@ async def list_databases(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def list_tables(database: str, ctx: Context) -> str:
-    """List all tables in a configured database."""
+async def list_tables(database: str, ctx: Context, schema: str | None = None) -> str:
+    """List all tables in a configured database (optionally scoped to a schema)."""
     backend = _get_backend(ctx, database)
-    tables = await backend.list_tables()
+    if schema is not None:
+        validate_identifier(schema)
+    tables = await backend.list_tables(schema=schema)
     return "\n".join(f"- {t}" for t in tables) if tables else "No tables found."
 
 
@@ -580,7 +583,7 @@ class DatabaseBackend(ABC):
         ...
 
     @abstractmethod
-    async def list_tables(self) -> list[str]: ...
+    async def list_tables(self, schema: str | None = None) -> list[str]: ...
 
     @abstractmethod
     async def describe_table(self, table: str) -> list[dict]: ...

@@ -228,15 +228,32 @@ class ClickHouseBackend(DatabaseBackend):
         truncated = [tuple(r) for r in all_rows[: self._max_rows]]
         return columns, truncated, total
 
-    async def list_tables(self) -> list[str]:
-        """List all tables in the configured ClickHouse database.
+    async def list_tables(self, schema: str | None = None) -> list[str]:
+        """List all tables in a ClickHouse database.
 
-        SHOW TABLES is a built-in ClickHouse command that returns all tables
-        in the current database. Each row has a single column with the table name.
+        When `schema` is None, returns tables from the connection's configured
+        default database (via `SHOW TABLES`, which ClickHouse scopes to the
+        current database).
+
+        When `schema` is provided, queries `system.tables` filtered by
+        `database = {name}` so the AI can discover tables in other databases
+        on the same connection without having to write the query by hand.
+        clickhouse-connect supports server-side parameter binding via
+        `{name:String}` placeholders — no string interpolation.
         """
         client = self._ensure_connected()
-        result = await asyncio.to_thread(client.query, "SHOW TABLES")
-        # result.result_rows is a list of tuples; each tuple has one element (table name)
+        if schema is None:
+            result = await asyncio.to_thread(client.query, "SHOW TABLES")
+            return [r[0] for r in result.result_rows]
+
+        # Parameterized query — ClickHouse binds the value server-side, so
+        # schema contents cannot become SQL. The validate_identifier check in
+        # the server tool is defense-in-depth.
+        result = await asyncio.to_thread(
+            client.query,
+            "SELECT name FROM system.tables WHERE database = {schema:String} ORDER BY name",
+            parameters={"schema": schema},
+        )
         return [r[0] for r in result.result_rows]
 
     async def describe_table(self, table: str) -> list[dict]:

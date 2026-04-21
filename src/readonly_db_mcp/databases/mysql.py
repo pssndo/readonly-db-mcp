@@ -198,13 +198,17 @@ class _MySQLFamilyBackend(DatabaseBackend):
         truncated = [tuple(r) for r in rows[: self._max_rows]]
         return columns, truncated, total
 
-    async def list_tables(self) -> list[str]:
-        """List all user tables in the configured database.
+    async def list_tables(self, schema: str | None = None) -> list[str]:
+        """List user tables in a database.
 
-        MySQL/MariaDB: scope to the currently-connected database via
-        `table_schema = DATABASE()`. System schemas (mysql, information_schema,
-        performance_schema, sys) should never show up because they have
-        different schema names, but we exclude them defensively.
+        When `schema` is None, scope to the currently-connected database via
+        `table_schema = DATABASE()`. When provided, scope to that schema instead
+        (using a parameterized `%s` placeholder — no string interpolation).
+
+        System schemas (mysql, information_schema, performance_schema, sys)
+        are excluded defensively when no explicit schema is given. When the
+        caller explicitly names one of those we honor it — if they want to
+        look at information_schema, that's their choice (and still read-only).
         """
         pool = self._ensure_connected()
         async with pool.acquire() as conn:
@@ -212,15 +216,26 @@ class _MySQLFamilyBackend(DatabaseBackend):
                 await cursor.execute(self._timeout_prelude_sql())
                 await cursor.execute("START TRANSACTION READ ONLY")
                 try:
-                    await cursor.execute(
-                        """
-                        SELECT table_name
-                        FROM information_schema.tables
-                        WHERE table_schema = DATABASE()
-                          AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
-                        ORDER BY table_name
-                        """
-                    )
+                    if schema is None:
+                        await cursor.execute(
+                            """
+                            SELECT table_name
+                            FROM information_schema.tables
+                            WHERE table_schema = DATABASE()
+                              AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+                            ORDER BY table_name
+                            """
+                        )
+                    else:
+                        await cursor.execute(
+                            """
+                            SELECT table_name
+                            FROM information_schema.tables
+                            WHERE table_schema = %s
+                            ORDER BY table_name
+                            """,
+                            (schema,),
+                        )
                     rows = await cursor.fetchall()
                 finally:
                     await cursor.execute("COMMIT")

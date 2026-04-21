@@ -207,6 +207,40 @@ class TestListTables:
         result = await list_tables("nope", ctx)
         assert "Error:" in result
 
+    async def test_schema_param_forwarded_to_backend(self) -> None:
+        """When a schema is given, the backend's list_tables should be called
+        with schema=... so the backend can scope its metadata query."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        await list_tables("testpg", ctx, schema="reporting")
+        pg.list_tables.assert_called_once_with(schema="reporting")
+
+    async def test_no_schema_passes_none_to_backend(self) -> None:
+        """Without a schema, the backend gets schema=None — default scope."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        await list_tables("testpg", ctx)
+        pg.list_tables.assert_called_once_with(schema=None)
+
+    async def test_schema_identifier_validated(self) -> None:
+        """Unsafe schema names must be rejected before reaching the backend.
+        Even though backends parameterize the value, defense-in-depth: catch
+        obviously-bad input here with a clear error."""
+        pg = _make_pg_backend()
+        ctx = _make_ctx({"testpg": pg})
+        result = await list_tables("testpg", ctx, schema="foo; DROP TABLE bar")
+        assert "Error:" in result
+        assert "Invalid identifier" in result
+        pg.list_tables.assert_not_called()
+
+    async def test_empty_result_for_schema_mentions_schema(self) -> None:
+        pg = _make_pg_backend()
+        pg.list_tables = AsyncMock(return_value=[])
+        ctx = _make_ctx({"testpg": pg})
+        result = await list_tables("testpg", ctx, schema="empty_schema")
+        assert "empty_schema" in result
+        assert "No tables found" in result
+
 
 class TestDescribeTable:
     """Tests for describe_table tool."""
@@ -401,6 +435,69 @@ class TestErrorForwarding:
         # Message truncated at 500 chars
         assert "x" * 600 not in result
         assert "..." in result
+
+
+class TestSchemaErrorHint:
+    """Schema-shaped driver errors (unknown column, unknown table, etc.) should
+    suffix a hint pointing the AI at describe_table / list_tables.
+
+    The hint never replaces the driver's message — it's appended. Driver
+    messages that don't look schema-related pass through unchanged."""
+
+    async def test_mysql_unknown_column_gets_hint(self) -> None:
+        my = _make_mysql_backend()
+        my.execute = AsyncMock(
+            side_effect=RuntimeError("(1054, \"Unknown column 'foo' in 'field list'\")")
+        )
+        ctx = _make_ctx({"testmysql": my})
+        result = await query_mysql("SELECT foo FROM users", ctx)
+        # Driver's message is preserved
+        assert "Unknown column" in result
+        # Hint points at the right tools
+        assert "describe_table" in result
+        assert "list_tables" in result
+
+    async def test_postgres_column_does_not_exist_gets_hint(self) -> None:
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(
+            side_effect=RuntimeError('column "foo" does not exist')
+        )
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT foo FROM users", ctx)
+        assert "does not exist" in result
+        assert "describe_table" in result
+
+    async def test_clickhouse_unknown_identifier_gets_hint(self) -> None:
+        ch = _make_ch_backend()
+        ch.execute = AsyncMock(
+            side_effect=RuntimeError("Code: 47. DB::Exception: Unknown identifier: foo")
+        )
+        ctx = _make_ctx({"testch": ch})
+        result = await query_clickhouse("SELECT foo FROM events", ctx)
+        assert "Unknown identifier" in result
+        assert "describe_table" in result
+
+    async def test_generic_error_does_not_get_hint(self) -> None:
+        """A timeout or connection error shouldn't suggest describe_table —
+        that would mislead the AI."""
+        pg = _make_pg_backend()
+        pg.execute = AsyncMock(side_effect=RuntimeError("connection refused"))
+        ctx = _make_ctx({"testpg": pg})
+        result = await query_postgres("SELECT 1", ctx)
+        assert "connection refused" in result
+        assert "describe_table" not in result
+
+    async def test_explain_query_unknown_column_gets_hint(self) -> None:
+        """User's reported scenario: EXPLAIN of a query with a bad column name.
+        The hint should show up on the explain path too."""
+        pg = _make_pg_backend()
+        pg.explain = AsyncMock(
+            side_effect=RuntimeError('column "typo" does not exist')
+        )
+        ctx = _make_ctx({"testpg": pg})
+        result = await explain_query("SELECT typo FROM users", "testpg", ctx)
+        assert "does not exist" in result
+        assert "describe_table" in result
 
 
 # ---------------------------------------------------------------------------

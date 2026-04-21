@@ -207,7 +207,7 @@ Ten tools are exposed to the AI agent:
 | `query_mysql` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MySQL |
 | `query_mariadb` | `sql`, `database?`, `output_format?` | Run a read-only SQL query against MariaDB |
 | `list_databases` | (none) | List all configured database connections |
-| `list_tables` | `database` | List all tables in a database |
+| `list_tables` | `database`, `schema?` | List all tables in a database (optionally scoped to a specific schema) |
 | `describe_table` | `database`, `table` | Columns, types, nullability (+ engine/rows/keys for CH and MySQL/MariaDB) |
 | `sample_table` | `database`, `table`, `n?`, `output_format?` | First N rows of a table (validated `SELECT * LIMIT n`) |
 | `explain_query` | `sql`, `database`, `analyze?` | Show the query execution plan |
