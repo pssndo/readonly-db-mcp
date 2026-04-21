@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "readonly-db-mcp"
 version = "0.1.0"
-description = "Read-only MCP server for PostgreSQL, ClickHouse, MySQL, and MariaDB — safe database access for AI agents"
+description = "Read-only MCP server for PostgreSQL, ClickHouse, MySQL, MariaDB, and SQLite — safe database access for AI agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
     { name = "Passendo" },
 ]
-keywords = ["mcp", "postgresql", "clickhouse", "mysql", "mariadb", "read-only", "ai", "claude"]
+keywords = ["mcp", "postgresql", "clickhouse", "mysql", "mariadb", "sqlite", "read-only", "ai", "claude"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

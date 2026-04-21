@@ -129,9 +129,9 @@ class TestLoadConfig:
         # monkeypatch.delenv with raising=False is a no-op if the var doesn't exist.
         # Use a wide range (1-100) since the loader scans all env vars by regex
         # and doesn't stop at gaps — PG_50_NAME would still be found.
-        for prefix in ("PG_", "CH_", "MYSQL_", "MARIADB_"):
+        for prefix in ("PG_", "CH_", "MYSQL_", "MARIADB_", "SQLITE_"):
             for i in range(1, 101):
-                for suffix in ("NAME", "HOST", "PORT", "DATABASE", "USER", "PASSWORD", "SECURE"):
+                for suffix in ("NAME", "HOST", "PORT", "DATABASE", "USER", "PASSWORD", "SECURE", "PATH"):
                     monkeypatch.delenv(f"{prefix}{i}_{suffix}", raising=False)
         with pytest.raises(ValueError, match="No database connections configured"):
             load_config()
@@ -348,3 +348,50 @@ class TestMysqlMariadbConfig:
         assert len(config.mysql_connections) == 2
         assert config.mysql_connections[0].name == "mysql1"
         assert config.mysql_connections[1].name == "mysql2"
+
+
+class TestSqliteConfig:
+    """SQLite has a different shape (path instead of host/port/user/password)."""
+
+    def test_sqlite_basic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SQLITE_1_NAME", "local_dev")
+        monkeypatch.setenv("SQLITE_1_PATH", "/var/data/app.db")
+
+        config = load_config()
+        assert len(config.sqlite_connections) == 1
+        assert config.sqlite_connections[0].name == "local_dev"
+        assert config.sqlite_connections[0].path == "/var/data/app.db"
+
+    def test_sqlite_missing_path_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # NAME present but PATH missing — partial config detected via scan.
+        monkeypatch.setenv("SQLITE_1_NAME", "whatever")
+        with pytest.raises(ValueError, match="SQLITE_1_PATH"):
+            load_config()
+
+    def test_sqlite_missing_name_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SQLITE_1_PATH", "/tmp/app.db")
+        with pytest.raises(ValueError, match="SQLITE_1_NAME"):
+            load_config()
+
+    def test_multiple_sqlite_connections(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for i, name in ((1, "dev"), (2, "staging")):
+            monkeypatch.setenv(f"SQLITE_{i}_NAME", name)
+            monkeypatch.setenv(f"SQLITE_{i}_PATH", f"/data/{name}.db")
+
+        config = load_config()
+        assert len(config.sqlite_connections) == 2
+        assert config.sqlite_connections[0].name == "dev"
+        assert config.sqlite_connections[1].path == "/data/staging.db"
+
+    def test_sqlite_coexists_with_other_backends(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PG_1_NAME", "pg1")
+        monkeypatch.setenv("PG_1_HOST", "h")
+        monkeypatch.setenv("PG_1_DATABASE", "d")
+        monkeypatch.setenv("PG_1_USER", "u")
+        monkeypatch.setenv("PG_1_PASSWORD", "p")
+        monkeypatch.setenv("SQLITE_1_NAME", "local")
+        monkeypatch.setenv("SQLITE_1_PATH", "/tmp/app.db")
+
+        config = load_config()
+        assert len(config.postgres_connections) == 1
+        assert len(config.sqlite_connections) == 1

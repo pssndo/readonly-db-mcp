@@ -34,6 +34,7 @@ from .databases.base import DatabaseBackend, validate_identifier
 from .databases.clickhouse import ClickHouseBackend
 from .databases.mysql import MariaDBBackend, MySQLBackend
 from .databases.postgres import PostgresBackend
+from .databases.sqlite import SqliteBackend
 from .formatting import format_results, format_markdown_table
 from .validation import validate_read_only
 
@@ -80,6 +81,7 @@ async def lifespan(server: FastMCP):
         + [ch.name for ch in config.clickhouse_connections]
         + [my.name for my in config.mysql_connections]
         + [md.name for md in config.mariadb_connections]
+        + [sq.name for sq in config.sqlite_connections]
     )
     seen: set[str] = set()
     for name in all_names:
@@ -91,10 +93,11 @@ async def lifespan(server: FastMCP):
     ch_count = len(config.clickhouse_connections)
     my_count = len(config.mysql_connections)
     md_count = len(config.mariadb_connections)
-    total_count = pg_count + ch_count + my_count + md_count
+    sq_count = len(config.sqlite_connections)
+    total_count = pg_count + ch_count + my_count + md_count + sq_count
     logger.info(
-        "Starting readonly-db-mcp with %d PostgreSQL, %d ClickHouse, %d MySQL, %d MariaDB connections",
-        pg_count, ch_count, my_count, md_count,
+        "Starting readonly-db-mcp with %d PostgreSQL, %d ClickHouse, %d MySQL, %d MariaDB, %d SQLite connections",
+        pg_count, ch_count, my_count, md_count, sq_count,
     )
 
     try:
@@ -151,6 +154,17 @@ async def lifespan(server: FastMCP):
             except Exception:
                 logger.exception("Failed to connect to MariaDB '%s' — skipping this backend", md.name)
 
+        # Initialize SQLite connections (file-based, read-only at the VFS layer)
+        for sq in config.sqlite_connections:
+            backend = SqliteBackend(sq, config)
+            logger.info("Opening SQLite '%s' at %s (read-only)", sq.name, sq.path)
+            try:
+                await backend.connect()
+                ctx.backends[sq.name] = backend
+                logger.info("Opened SQLite '%s'", sq.name)
+            except Exception:
+                logger.exception("Failed to open SQLite '%s' — skipping this backend", sq.name)
+
         # At least one backend must have succeeded, otherwise the server is useless
         if not ctx.backends:
             raise RuntimeError(
@@ -185,6 +199,7 @@ _QUERY_TOOL_FOR_TYPE = {
     "clickhouse": "query_clickhouse",
     "mysql": "query_mysql",
     "mariadb": "query_mariadb",
+    "sqlite": "query_sqlite",
 }
 
 
@@ -304,6 +319,8 @@ def _dialect_for_backend(backend: DatabaseBackend) -> str:
         return "postgres"
     if backend.db_type in ("mysql", "mariadb"):
         return "mysql"
+    if backend.db_type == "sqlite":
+        return "sqlite"
     return "clickhouse"
 
 
@@ -544,6 +561,65 @@ async def query_mariadb(
 
 
 @mcp.tool()
+async def query_sqlite(
+    sql: str,
+    ctx: Context,
+    database: str | None = None,
+    output_format: str = "table",
+) -> str:
+    """Execute a read-only SELECT against a SQLite database.
+
+    SQLite is a file-based database, not a server. The connection is opened
+    in VFS-level read-only mode (`file:/path/to/db?mode=ro`), which makes
+    the database immutable for the life of the connection — no journal
+    creation, no schema change, no ATTACH. Layer 2 protection is continuous
+    rather than per-query.
+
+    For common lookups there are dedicated tools that are faster and clearer
+    than writing raw SQL — prefer them:
+      - `list_tables` / `list_databases` — discovery (don't write `SELECT
+        name FROM sqlite_master`)
+      - `describe_table` — columns + types (replaces `PRAGMA table_info`)
+      - `sample_table` — peek at a few rows of a table
+      - `explain_query` — execution plan (uses `EXPLAIN QUERY PLAN`)
+
+    Only SELECT-family queries pass validation. `ATTACH DATABASE`, `DETACH`,
+    `PRAGMA writable_schema=ON`, and all write/DDL statements are rejected
+    by the sqlglot AST check. Extension loading is separately disabled at
+    connection open, blocking `SELECT load_extension(...)` bypasses.
+
+    Params:
+      sql:           The SQL query.
+      database:      Connection name configured in env vars (e.g. "local_dev").
+                     This is the *connection name*, not the file path.
+                     Defaults to the first configured SQLite connection.
+                     Use `list_databases` to see available connection names.
+      output_format: "table" (markdown, default) | "vertical" (key=value per
+                     row, no truncation) | "json" (strict JSON envelope).
+
+    Results are capped at MAX_RESULT_ROWS (default 1000) via a server-side
+    LIMIT injection that preserves your ORDER BY. Note: SQLite doesn't
+    support schemas (no ATTACH — see above), so `list_tables(schema=...)`
+    is intentionally unsupported for SQLite connections.
+    """
+    try:
+        fmt = _validate_output_format(output_format)
+        clean_sql = validate_read_only(sql, dialect="sqlite")
+        backend = _get_backend(ctx, database, db_type="sqlite")
+        logger.debug("query_sqlite [%s]: %s", backend.name, clean_sql[:200])
+        columns, rows, total = await backend.execute(clean_sql)
+        logger.debug("query_sqlite [%s]: %d columns, %d rows returned", backend.name, len(columns), len(rows))
+        return format_results(columns, rows, total, output_format=fmt)
+    except ValueError as e:
+        logger.info("query_sqlite validation error: %s", e)
+        return f"Error: {e}"
+    except Exception as e:
+        logger.exception("query_sqlite execution failed")
+        msg = _safe_error_message(e)
+        return f"Error: query execution failed: {msg}{_schema_error_hint(msg)}"
+
+
+@mcp.tool()
 async def list_databases(ctx: Context) -> str:
     """List all configured database connections.
 
@@ -579,11 +655,16 @@ async def list_tables(database: str, ctx: Context, schema: str | None = None) ->
       - MySQL / MariaDB: table names in the connection's default database only
         (system schemas `mysql`, `information_schema`, `performance_schema`,
         `sys` are excluded).
+      - SQLite: all tables (`sqlite_*` internal metadata tables are excluded).
 
     When `schema` is provided, listing is restricted to that schema. This is
     the canonical way to discover tables in databases other than the
     connection's default — you no longer have to write raw `SELECT` against
     `system.tables` / `information_schema.tables` for this common case.
+
+    SQLite note: the `schema` parameter is not supported for SQLite connections
+    (SQLite databases are single files with a single namespace). Passing
+    `schema=...` to a SQLite connection returns a clear error.
 
     Params:
       database: Connection name from `list_databases` (not a schema name).
@@ -591,6 +672,7 @@ async def list_tables(database: str, ctx: Context, schema: str | None = None) ->
                 PG: a PostgreSQL schema (e.g. "public", "reporting").
                 CH: a ClickHouse database (e.g. "develop_db").
                 MySQL/MariaDB: a database name (e.g. "legacy_app").
+                SQLite: not supported (raises ValueError).
 
     Next step: call `describe_table(database, table)` for columns and metadata,
     or `sample_table(database, table, n=5)` to see a few rows.
@@ -814,6 +896,7 @@ set up by the operator at server startup.
 - `query_clickhouse` — Ad-hoc SELECT against a ClickHouse connection.
 - `query_mysql` — Ad-hoc SELECT against a MySQL connection.
 - `query_mariadb` — Ad-hoc SELECT against a MariaDB connection.
+- `query_sqlite` — Ad-hoc SELECT against a SQLite file (opened VFS-level read-only).
 - `explain_query` — Execution plan. Don't write `EXPLAIN`. (MySQL/MariaDB:
   plain EXPLAIN only — `EXPLAIN ANALYZE` / `ANALYZE SELECT` actually execute
   the inner query and are deliberately not exposed via this tool.)
@@ -875,6 +958,14 @@ under the hood; picking the wrong tool fails fast with a clear error:
 Same enforcement applies across every type pair (PG/CH/MySQL/MariaDB) —
 connection-name lookups never cross flavor boundaries silently.
 
+## SQLite
+SQLite connections are opened in VFS-level read-only mode (`file:/path/?mode=ro`),
+which makes the database immutable for the life of the connection.
+`ATTACH DATABASE` and `load_extension()` are blocked at the validator and
+connection layers respectively. Query with `query_sqlite`. Note: SQLite
+has no schema concept (single-file databases), so `list_tables(schema=...)`
+is not supported — the connection's entire table list is returned directly.
+
 ## Write safety (informational)
 All write operations (INSERT/UPDATE/DELETE/DDL) are rejected at the SQL
 parse layer. The DB user should also have SELECT-only grants. Raw
@@ -884,6 +975,9 @@ dedicated tools above instead.
 For MySQL/MariaDB specifically: `EXPLAIN ANALYZE <stmt>` executes the inner
 query (same as PostgreSQL's EXPLAIN ANALYZE). `explain_query` always uses
 plain `EXPLAIN` (plan-only, no execution) to keep this safe.
+
+For SQLite: `EXPLAIN QUERY PLAN` is strictly plan-only and never executes
+the inner query (safer than PG/MySQL in this respect).
 
 ## Result limits
 Every query is capped at `MAX_RESULT_ROWS` (default 1000) via LIMIT

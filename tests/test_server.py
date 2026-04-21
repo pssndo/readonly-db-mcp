@@ -12,6 +12,7 @@ from readonly_db_mcp.server import (
     query_clickhouse,
     query_mysql,
     query_mariadb,
+    query_sqlite,
     list_databases,
     list_tables,
     describe_table,
@@ -68,6 +69,27 @@ def _make_ch_backend(name: str = "testch") -> MagicMock:
     )
     backend.table_stats = AsyncMock(return_value=None)  # can be overridden per-test
     backend.explain = AsyncMock(return_value="Expression\n  ReadFromMergeTree")
+    return backend
+
+
+def _make_sqlite_backend(name: str = "testsqlite") -> MagicMock:
+    """Create a mock SQLite backend."""
+    backend = MagicMock()
+    backend.db_type = "sqlite"
+    backend.host = "(file)"
+    backend.database = "/tmp/fake.db"
+    backend.path = "/tmp/fake.db"
+    backend.name = name
+    backend.execute = AsyncMock(return_value=(["id", "name"], [(1, "Alice"), (2, "Bob")], 2))
+    backend.list_tables = AsyncMock(return_value=["users", "orders"])
+    backend.describe_table = AsyncMock(
+        return_value=[
+            {"name": "id", "type": "INTEGER", "nullable": "NO"},
+            {"name": "name", "type": "TEXT", "nullable": "YES"},
+        ]
+    )
+    backend.table_stats = AsyncMock(return_value=None)
+    backend.explain = AsyncMock(return_value="SEARCH users USING INTEGER PRIMARY KEY (id=?)")
     return backend
 
 
@@ -743,3 +765,117 @@ class TestUsageGuideMysql:
         # Connections block should show both flavors
         assert "my" in result
         assert "md" in result
+
+
+# ---------------------------------------------------------------------------
+# SQLite tool path
+# ---------------------------------------------------------------------------
+
+
+class TestQuerySqlite:
+    """Tests for query_sqlite tool."""
+
+    async def test_valid_select(self) -> None:
+        sq = _make_sqlite_backend()
+        ctx = _make_ctx({"testsqlite": sq})
+        result = await query_sqlite("SELECT * FROM users", ctx)
+        assert "| id | name |" in result
+        assert "| 1 | Alice |" in result
+        sq.execute.assert_called_once_with("SELECT * FROM users")
+
+    async def test_write_query_rejected(self) -> None:
+        ctx = _make_ctx({"testsqlite": _make_sqlite_backend()})
+        result = await query_sqlite("DELETE FROM users", ctx)
+        assert "Error:" in result
+
+    async def test_attach_database_rejected(self) -> None:
+        """ATTACH DATABASE is SQLite-specific — make sure the validator
+        catches it at the tool layer (the backend's VFS read-only mode is
+        a second line of defense)."""
+        ctx = _make_ctx({"testsqlite": _make_sqlite_backend()})
+        result = await query_sqlite("ATTACH DATABASE '/tmp/other.db' AS o", ctx)
+        assert "Error:" in result
+
+    async def test_no_sqlite_configured(self) -> None:
+        ctx = _make_ctx({"testpg": _make_pg_backend()})
+        result = await query_sqlite("SELECT 1", ctx)
+        assert "Error:" in result
+        assert "No sqlite database configured" in result
+
+    async def test_cross_type_rejection(self) -> None:
+        """query_sqlite(database='a_postgres_conn') must fail fast with a
+        pointed message — same policy as the other query_* tools."""
+        pg = _make_pg_backend(name="pg1")
+        sq = _make_sqlite_backend(name="sq1")
+        ctx = _make_ctx({"pg1": pg, "sq1": sq})
+        result = await query_sqlite("SELECT 1", ctx, database="pg1")
+        assert "Error:" in result
+        assert "'pg1' is a postgres connection, not sqlite" in result
+        assert "query_postgres" in result
+
+    async def test_json_output(self) -> None:
+        import json as _json
+        ctx = _make_ctx({"testsqlite": _make_sqlite_backend()})
+        result = await query_sqlite("SELECT * FROM users", ctx, output_format="json")
+        data = _json.loads(result)
+        assert data["columns"] == ["id", "name"]
+        assert data["rows"] == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+
+class TestSqliteSharedTools:
+    """Shared tools (list_tables, describe_table, sample_table, explain_query)
+    should dispatch to SQLite backends correctly."""
+
+    async def test_list_tables_sqlite(self) -> None:
+        ctx = _make_ctx({"testsqlite": _make_sqlite_backend()})
+        result = await list_tables("testsqlite", ctx)
+        assert "users" in result
+        assert "orders" in result
+
+    async def test_list_tables_sqlite_schema_param_surfaces_backend_error(self) -> None:
+        """SQLite's backend raises ValueError when schema is given. The server
+        tool forwards that as a clear error message."""
+        sq = _make_sqlite_backend()
+        sq.list_tables = AsyncMock(side_effect=ValueError(
+            "SQLite does not support the `schema` parameter on list_tables."
+        ))
+        ctx = _make_ctx({"testsqlite": sq})
+        result = await list_tables("testsqlite", ctx, schema="main")
+        assert "Error:" in result
+        assert "does not support" in result
+
+    async def test_describe_table_sqlite(self) -> None:
+        ctx = _make_ctx({"testsqlite": _make_sqlite_backend()})
+        result = await describe_table("testsqlite", "users", ctx)
+        assert "| id | INTEGER | NO |" in result
+        assert "| name | TEXT | YES |" in result
+
+    async def test_sample_table_sqlite(self) -> None:
+        sq = _make_sqlite_backend()
+        ctx = _make_ctx({"testsqlite": sq})
+        result = await sample_table("testsqlite", "users", ctx, n=3)
+        sq.execute.assert_called_once()
+        sent_sql = sq.execute.call_args[0][0]
+        assert "SELECT * FROM users LIMIT 3" == sent_sql
+        assert "| id | name |" in result
+
+    async def test_explain_query_sqlite(self) -> None:
+        sq = _make_sqlite_backend()
+        ctx = _make_ctx({"testsqlite": sq})
+        result = await explain_query("SELECT * FROM users WHERE id = 1", "testsqlite", ctx)
+        assert "SEARCH users" in result
+        sq.explain.assert_called_once()
+
+    async def test_list_databases_shows_sqlite(self) -> None:
+        ctx = _make_ctx({"sq": _make_sqlite_backend(name="sq")})
+        result = await list_databases(ctx)
+        assert "(sqlite)" in result
+
+
+class TestUsageGuideSqlite:
+    async def test_guide_mentions_sqlite(self) -> None:
+        ctx = _make_ctx({"sq": _make_sqlite_backend(name="sq")})
+        result = await usage_guide(ctx)
+        assert "query_sqlite" in result
+        # SQLite-specific block should appear when SQLite is configured
+        assert "SQLite" in result or "sqlite" in result

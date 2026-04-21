@@ -13,11 +13,13 @@ from readonly_db_mcp.databases.clickhouse import (
     _is_retriable_connection_error,
 )
 from readonly_db_mcp.databases.mysql import MariaDBBackend, MySQLBackend
+from readonly_db_mcp.databases.sqlite import SqliteBackend
 from readonly_db_mcp.config import (
     PostgresConnection,
     ClickHouseConnection,
     MysqlConnection,
     MariaDBConnection,
+    SqliteConnection,
     Config,
 )
 
@@ -347,3 +349,209 @@ class TestInjectLimit:
         result = inject_limit("SELECT * FROM users ORDER BY name LIMIT 50", 100, "postgres")
         assert "ORDER BY" in result.upper()
         assert "50" in result
+
+
+# ---------------------------------------------------------------------------
+# SqliteBackend — unit tests + real-file round-trip (SQLite is stdlib, so we
+# can exercise the full stack without a separate server process).
+# ---------------------------------------------------------------------------
+
+
+class TestSqliteBackendUnit:
+    """Constructor + guard tests that don't need a real file."""
+
+    def _make_config(self, **overrides) -> SqliteConnection:
+        defaults = {"name": "test_sqlite", "path": "/tmp/does_not_exist.db"}
+        defaults.update(overrides)
+        return SqliteConnection(**defaults)
+
+    def test_ensure_connected_raises_before_connect(self) -> None:
+        backend = SqliteBackend(self._make_config())
+        with pytest.raises(RuntimeError, match="Not connected"):
+            backend._ensure_connected()
+
+    def test_constructor_stores_config(self) -> None:
+        app_cfg = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=45, max_result_rows=250,
+        )
+        backend = SqliteBackend(self._make_config(path="/data/app.db"), app_cfg)
+        assert backend._timeout == 45
+        assert backend._max_rows == 250
+        assert backend.path == "/data/app.db"
+        # host/database are synthetic for list_databases uniformity
+        assert backend.host == "(file)"
+        assert backend.database == "/data/app.db"
+
+    def test_db_type_is_class_level(self) -> None:
+        assert SqliteBackend.db_type == "sqlite"
+
+    def test_constructor_defaults_without_config(self) -> None:
+        backend = SqliteBackend(self._make_config())
+        assert backend._timeout == 30
+        assert backend._max_rows == 1000
+
+    def test_path_with_question_mark_rejected(self) -> None:
+        """'?' in path would confuse the SQLite URI parser (which uses '?' to
+        separate path from query string). Reject at open time with a clear
+        error rather than passing through to an unexpected URI interpretation."""
+        import asyncio
+        backend = SqliteBackend(self._make_config(path="/tmp/weird?name.db"))
+        with pytest.raises(ValueError, match="conflicts with URI syntax"):
+            asyncio.run(backend.connect())
+
+
+class TestSqliteBackendRoundTrip:
+    """Real SQLite round-trip tests. SQLite is stdlib, so we can set up a
+    temp DB file and exercise the full backend without any external service.
+
+    These tests are the only place in the suite where we actually run SQL
+    against a live DB, which makes them especially valuable for the SQLite
+    backend. They exercise: VFS-level read-only (can't write), ATTACH
+    blocking, extension-loading block, list_tables, describe_table, execute,
+    explain.
+    """
+
+    async def _fresh_db(self, tmp_path) -> SqliteBackend:
+        """Create a temp SQLite DB, populate it, and return a connected backend."""
+        import sqlite3
+        db_path = tmp_path / "test.db"
+        # Populate with a normal (writable) connection, then open the
+        # backend separately in read-only mode.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT);
+            INSERT INTO users (name, email) VALUES ('Alice', 'a@x'), ('Bob', NULL);
+            CREATE TABLE orders (id INTEGER, user_id INTEGER, total REAL);
+        """)
+        conn.commit()
+        conn.close()
+
+        backend = SqliteBackend(SqliteConnection(name="test", path=str(db_path)))
+        await backend.connect()
+        return backend
+
+    async def test_readonly_mode_blocks_writes(self, tmp_path) -> None:
+        """Core security test: even if the validator were bypassed, the
+        VFS-level read-only mode refuses writes at the SQLite layer."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            # Bypass the validator by calling backend.execute directly with
+            # raw SQL. SQLite itself must still refuse the write.
+            import sqlite3
+            with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+                await backend.execute("INSERT INTO users (name) VALUES ('Charlie')")
+        finally:
+            await backend.disconnect()
+
+    async def test_attach_database_not_blocked_at_vfs_layer(self, tmp_path) -> None:
+        """IMPORTANT: ATTACH DATABASE is NOT blocked by VFS read-only mode.
+        SQLite will happily ATTACH another file (also read-only) to a
+        read-only main DB. This means the validator (Layer 1) is our only
+        defense against ATTACH — if it were ever relaxed, a caller could
+        attach paths outside the operator's configured set.
+
+        This test documents that fact so a future change doesn't accidentally
+        start relying on VFS read-only to block ATTACH."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            other_path = tmp_path / "other.db"
+            import sqlite3
+            sqlite3.connect(str(other_path)).close()
+            # This succeeds — SQLite attaches the other file read-only.
+            # The test is here to catch regressions in our understanding of
+            # SQLite's behavior, not to assert a block that doesn't exist.
+            await backend.execute(f"ATTACH DATABASE '{other_path}' AS other")
+        finally:
+            await backend.disconnect()
+
+    async def test_list_tables_excludes_sqlite_internals(self, tmp_path) -> None:
+        backend = await self._fresh_db(tmp_path)
+        try:
+            tables = await backend.list_tables()
+            assert "users" in tables
+            assert "orders" in tables
+            # sqlite_* internal tables are excluded
+            assert not any(t.startswith("sqlite_") for t in tables)
+        finally:
+            await backend.disconnect()
+
+    async def test_list_tables_with_schema_param_raises(self, tmp_path) -> None:
+        backend = await self._fresh_db(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="does not support the `schema` parameter"):
+                await backend.list_tables(schema="main")
+        finally:
+            await backend.disconnect()
+
+    async def test_describe_table(self, tmp_path) -> None:
+        backend = await self._fresh_db(tmp_path)
+        try:
+            cols = await backend.describe_table("users")
+            names = [c["name"] for c in cols]
+            assert names == ["id", "name", "email"]
+            # NOT NULL enforcement is reflected in `nullable`
+            by_name = {c["name"]: c for c in cols}
+            assert by_name["name"]["nullable"] == "NO"
+            assert by_name["email"]["nullable"] == "YES"
+        finally:
+            await backend.disconnect()
+
+    async def test_describe_table_rejects_unsafe_identifier(self, tmp_path) -> None:
+        backend = await self._fresh_db(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="Invalid identifier"):
+                await backend.describe_table("users; DROP TABLE users")
+        finally:
+            await backend.disconnect()
+
+    async def test_execute_returns_rows(self, tmp_path) -> None:
+        backend = await self._fresh_db(tmp_path)
+        try:
+            cols, rows, total = await backend.execute("SELECT id, name FROM users ORDER BY id")
+            assert cols == ["id", "name"]
+            assert rows == [(1, "Alice"), (2, "Bob")]
+            assert total == 2
+        finally:
+            await backend.disconnect()
+
+    async def test_execute_zero_rows_preserves_columns(self, tmp_path) -> None:
+        """DB-API 2.0 guarantees cursor.description is populated even for
+        zero-row results, so empty queries still carry the schema."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            cols, rows, total = await backend.execute(
+                "SELECT id, name FROM users WHERE id = -999"
+            )
+            assert cols == ["id", "name"]
+            assert rows == []
+            assert total == 0
+        finally:
+            await backend.disconnect()
+
+    async def test_explain_query_plan_is_plan_only(self, tmp_path) -> None:
+        """EXPLAIN QUERY PLAN is strictly plan-only in SQLite — no execution.
+        We verify it returns something human-readable rather than raw opcodes."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            plan = await backend.explain("SELECT * FROM users WHERE id = 1")
+            # Should mention the table in the plan (SEARCH or SCAN users)
+            assert "users" in plan.lower()
+        finally:
+            await backend.disconnect()
+
+    async def test_load_extension_is_disabled(self, tmp_path) -> None:
+        """load_extension() would be a write bypass — the backend disables it
+        at connect time. Verify it raises when called."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            import sqlite3
+            # load_extension raises with a clear message when disabled.
+            # We call it via the raw connection to test the backend's
+            # connect-time hardening, not via execute (which would also be
+            # blocked by the validator at the tool layer).
+            conn = backend._ensure_connected()
+            with pytest.raises(sqlite3.OperationalError, match="not authorized|disabled"):
+                conn.execute("SELECT load_extension('/tmp/nonexistent.so')")
+        finally:
+            await backend.disconnect()
