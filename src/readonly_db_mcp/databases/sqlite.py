@@ -52,11 +52,19 @@ Security notes specific to SQLite:
 import asyncio
 import logging
 import sqlite3
+import time
 
 from ..config import Config, SqliteConnection
 from .base import DatabaseBackend, inject_limit, validate_identifier
 
 logger = logging.getLogger("readonly_db_mcp.sqlite")
+
+# Progress-handler tick: SQLite invokes the callback every N VDBE opcodes.
+# 1000 is the SQLite docs' recommended "frequent enough to cancel long queries
+# within a sensible latency, infrequent enough that overhead is negligible"
+# default. On a modern CPU this fires roughly every few milliseconds of query
+# work — good enough granularity for our timeout purpose.
+_PROGRESS_HANDLER_OPCODES = 1000
 
 
 class SqliteBackend(DatabaseBackend):
@@ -76,6 +84,15 @@ class SqliteBackend(DatabaseBackend):
         self._conn: sqlite3.Connection | None = None
         self._timeout = app_config.query_timeout_seconds if app_config else 30
         self._max_rows = app_config.max_result_rows if app_config else 1000
+        # Serialize access to the single connection. sqlite3.Connection is
+        # thread-safe at the C layer but not reentrant in a way we can rely on
+        # for our usage pattern: we share one connection across concurrent
+        # asyncio.to_thread() calls (FastMCP can invoke tool methods in
+        # parallel). Without this lock, two `cur.execute()` calls could hit
+        # the same connection simultaneously and cause SQLITE_MISUSE or
+        # surprising cursor state bleed-through. The lock is cheap (uncontended
+        # for single-user workloads) and makes the invariant explicit.
+        self._lock = asyncio.Lock()
 
     def _ensure_connected(self) -> sqlite3.Connection:
         """Return the connection, raising RuntimeError if not connected.
@@ -114,15 +131,70 @@ class SqliteBackend(DatabaseBackend):
         conn = sqlite3.connect(
             uri,
             uri=True,
-            timeout=self._timeout,  # seconds to wait for a busy lock
-            check_same_thread=False,  # see docstring — safe given serial to_thread usage
+            # Note: sqlite3's `timeout` param is the busy-wait timeout for
+            # acquiring a database lock — it is NOT a statement execution
+            # timeout. Our per-query execution timeout is enforced via a
+            # progress handler installed in `execute()` / `explain()`; see
+            # _install_progress_handler below. We still pass a small lock
+            # timeout so concurrent writers (if any, via a separate process)
+            # don't cause us to fail immediately.
+            timeout=min(self._timeout, 30),
+            check_same_thread=False,  # serialized via self._lock — see __init__
         )
         # Defense-in-depth: explicitly disable extension loading even though
         # Python's default is already False. This matters because a library
         # the process imports could enable it globally — we want local
         # guarantees.
-        conn.enable_load_extension(False)
+        #
+        # Some Python/SQLite builds are compiled without
+        # SQLITE_ENABLE_LOAD_EXTENSION (Debian/Ubuntu distro-stdlib, for
+        # example). On those builds, `enable_load_extension` raises
+        # NotSupportedError regardless of the argument — but the capability
+        # we were trying to disable is already absent, so the defense is
+        # achieved. Swallow the exception in that case and log at INFO so
+        # operators on stricter builds can see the backend started fine.
+        try:
+            conn.enable_load_extension(False)
+        except (sqlite3.NotSupportedError, AttributeError) as e:
+            # AttributeError covers pysqlite builds that omit the method
+            # entirely; NotSupportedError covers builds that stub it out.
+            logger.info(
+                "enable_load_extension not available for SQLite '%s' (%s) — "
+                "extension loading is already disabled by build configuration, "
+                "so the Layer 2 defense is still satisfied.",
+                self.name, e,
+            )
         return conn
+
+    def _install_progress_handler(self, conn: sqlite3.Connection) -> None:
+        """Install a progress handler that enforces `self._timeout` as an
+        execution timeout (not just a lock-wait timeout).
+
+        SQLite calls the handler every ~1000 VDBE opcodes (configurable).
+        Returning a non-zero value aborts the current statement with
+        `sqlite3.OperationalError: interrupted`. We record the start time
+        in a closure and abort once wall-clock elapsed exceeds the configured
+        timeout.
+
+        The handler is cleared by `_clear_progress_handler()` after the
+        statement completes (passing None as the callback). We install per-
+        query rather than once-for-life because the deadline has to reset
+        between queries.
+        """
+        deadline = time.monotonic() + self._timeout
+
+        def _handler() -> int:
+            # Non-zero return = abort. Returning 1 causes SQLite to raise
+            # OperationalError("interrupted") from the .execute() call.
+            if time.monotonic() > deadline:
+                return 1
+            return 0
+
+        conn.set_progress_handler(_handler, _PROGRESS_HANDLER_OPCODES)
+
+    def _clear_progress_handler(self, conn: sqlite3.Connection) -> None:
+        """Remove the progress handler. Passing None disables it."""
+        conn.set_progress_handler(None, 0)
 
     async def connect(self) -> None:
         """Open the read-only connection. Wrapped in to_thread because
@@ -130,10 +202,23 @@ class SqliteBackend(DatabaseBackend):
         self._conn = await asyncio.to_thread(self._open_readonly)
 
     async def disconnect(self) -> None:
-        """Close the connection."""
-        if self._conn:
-            await asyncio.to_thread(self._conn.close)
-            self._conn = None
+        """Close the connection.
+
+        We take `self._lock` here for the same reason query methods do: if a
+        query is in flight on a worker thread, closing the connection out from
+        under it would crash with a sqlite3 misuse error. Waiting on the lock
+        serializes shutdown behind any active query (bounded by the progress-
+        handler timeout, so shutdown can't hang indefinitely).
+
+        If the query is still queued waiting for the lock when disconnect
+        fires, it will acquire the lock after us, find `self._conn is None`,
+        and raise a clean RuntimeError("Not connected") from _ensure_connected.
+        That's the intended "backend shut down" signal.
+        """
+        async with self._lock:
+            if self._conn:
+                await asyncio.to_thread(self._conn.close)
+                self._conn = None
 
     async def execute(self, sql: str) -> tuple[list[str], list[tuple], int]:
         """Execute a read-only SELECT.
@@ -146,26 +231,43 @@ class SqliteBackend(DatabaseBackend):
         sqlite3.Cursor.description is populated even for zero-row results,
         so column metadata survives empty queries (no prepare() dance like
         asyncpg needs).
-        """
-        conn = self._ensure_connected()
 
+        Execution timeout: a progress handler installed for the duration of
+        this query aborts execution once `self._timeout` seconds elapse
+        (see `_install_progress_handler`). Unlike sqlite3's `timeout`
+        constructor param (lock-wait only), this actually bounds CPU/disk
+        work done by a slow query.
+
+        Concurrency: the `self._lock` guard ensures only one query uses the
+        shared connection at a time, AND that disconnect() can't close the
+        connection between our connection check and our use of it. Note that
+        `_ensure_connected` is called INSIDE the lock — otherwise a shutdown
+        running between the check and the lock acquisition could invalidate
+        the connection we captured (TOCTOU).
+        """
         # Inject LIMIT to cap row count. Parse with dialect="sqlite" so
         # SQLite-specific syntax (like |||-string-concat or `glob`) round-trips
-        # correctly.
+        # correctly. This doesn't touch the connection so we can do it
+        # outside the lock.
         fetch_limit = self._max_rows + 1
         limited_sql = inject_limit(sql, fetch_limit, dialect="sqlite")
 
-        def _run() -> tuple[list[str], list[tuple], int]:
-            cur = conn.cursor()
-            try:
-                cur.execute(limited_sql)
-                columns = [d[0] for d in cur.description] if cur.description else []
-                rows = cur.fetchall()
-                return columns, rows, len(rows)
-            finally:
-                cur.close()
+        async with self._lock:
+            conn = self._ensure_connected()  # inside the lock — see docstring
 
-        columns, rows, _ = await asyncio.to_thread(_run)
+            def _run() -> tuple[list[str], list[tuple], int]:
+                self._install_progress_handler(conn)
+                cur = conn.cursor()
+                try:
+                    cur.execute(limited_sql)
+                    columns = [d[0] for d in cur.description] if cur.description else []
+                    rows = cur.fetchall()
+                    return columns, rows, len(rows)
+                finally:
+                    cur.close()
+                    self._clear_progress_handler(conn)
+
+            columns, rows, _ = await asyncio.to_thread(_run)
 
         if not rows:
             return columns, [], 0
@@ -186,26 +288,30 @@ class SqliteBackend(DatabaseBackend):
         sqlite_sequence, sqlite_stat1, etc.) since they're not usually what
         the AI wants to explore.
         """
-        conn = self._ensure_connected()
         if schema is not None:
             raise ValueError(
                 "SQLite does not support the `schema` parameter on list_tables. "
                 "SQLite databases are single files with a single namespace."
             )
 
-        def _run() -> list[str]:
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
-                    "ORDER BY name"
-                )
-                return [r[0] for r in cur.fetchall()]
-            finally:
-                cur.close()
+        async with self._lock:
+            conn = self._ensure_connected()  # inside the lock — avoids TOCTOU with disconnect()
 
-        return await asyncio.to_thread(_run)
+            def _run() -> list[str]:
+                self._install_progress_handler(conn)
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name"
+                    )
+                    return [r[0] for r in cur.fetchall()]
+                finally:
+                    cur.close()
+                    self._clear_progress_handler(conn)
+
+            return await asyncio.to_thread(_run)
 
     async def describe_table(self, table: str) -> list[dict]:
         """Describe columns via `PRAGMA table_info(<table>)`.
@@ -225,29 +331,34 @@ class SqliteBackend(DatabaseBackend):
         [A-Za-z_][A-Za-z0-9_.]*, so SQL injection via the table name is not
         possible.
         """
-        conn = self._ensure_connected()
         safe_table = validate_identifier(table)
 
-        def _run() -> list[dict]:
-            cur = conn.cursor()
-            try:
-                # PRAGMA table_info doesn't support parameter binding reliably
-                # across versions; safe_table has already been validated.
-                cur.execute(f"PRAGMA table_info({safe_table})")
-                out = []
-                for row in cur.fetchall():
-                    # row shape: (cid, name, type, notnull, dflt_value, pk)
-                    _, name, col_type, notnull, _, _ = row
-                    out.append({
-                        "name": name,
-                        "type": col_type or "",  # SQLite allows typeless columns
-                        "nullable": "NO" if notnull else "YES",
-                    })
-                return out
-            finally:
-                cur.close()
+        async with self._lock:
+            conn = self._ensure_connected()  # inside the lock — avoids TOCTOU with disconnect()
 
-        return await asyncio.to_thread(_run)
+            def _run() -> list[dict]:
+                self._install_progress_handler(conn)
+                cur = conn.cursor()
+                try:
+                    # PRAGMA table_info doesn't support parameter binding
+                    # reliably across versions; safe_table has already been
+                    # validated.
+                    cur.execute(f"PRAGMA table_info({safe_table})")
+                    out = []
+                    for row in cur.fetchall():
+                        # row shape: (cid, name, type, notnull, dflt_value, pk)
+                        _, name, col_type, notnull, _, _ = row
+                        out.append({
+                            "name": name,
+                            "type": col_type or "",  # SQLite allows typeless columns
+                            "nullable": "NO" if notnull else "YES",
+                        })
+                    return out
+                finally:
+                    cur.close()
+                    self._clear_progress_handler(conn)
+
+            return await asyncio.to_thread(_run)
 
     async def explain(self, sql: str, analyze: bool = False) -> str:
         """Return the query plan via `EXPLAIN QUERY PLAN`.
@@ -264,20 +375,24 @@ class SqliteBackend(DatabaseBackend):
         the validator's guarantee so this holds even if we switched to
         plain `EXPLAIN` (which outputs VDBE opcodes, also plan-only).
         """
-        conn = self._ensure_connected()
         explain_sql = f"EXPLAIN QUERY PLAN {sql}"
 
-        def _run() -> tuple[list[str], list[tuple]]:
-            cur = conn.cursor()
-            try:
-                cur.execute(explain_sql)
-                columns = [d[0] for d in cur.description] if cur.description else []
-                rows = cur.fetchall()
-                return columns, rows
-            finally:
-                cur.close()
+        async with self._lock:
+            conn = self._ensure_connected()  # inside the lock — avoids TOCTOU with disconnect()
 
-        columns, rows = await asyncio.to_thread(_run)
+            def _run() -> tuple[list[str], list[tuple]]:
+                self._install_progress_handler(conn)
+                cur = conn.cursor()
+                try:
+                    cur.execute(explain_sql)
+                    columns = [d[0] for d in cur.description] if cur.description else []
+                    rows = cur.fetchall()
+                    return columns, rows
+                finally:
+                    cur.close()
+                    self._clear_progress_handler(conn)
+
+            columns, rows = await asyncio.to_thread(_run)
 
         # EXPLAIN QUERY PLAN returns (id, parent, notused, detail). The
         # `detail` column has the human-readable plan text; other columns

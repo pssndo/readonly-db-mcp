@@ -571,9 +571,16 @@ async def query_sqlite(
 
     SQLite is a file-based database, not a server. The connection is opened
     in VFS-level read-only mode (`file:/path/to/db?mode=ro`), which makes
-    the database immutable for the life of the connection — no journal
-    creation, no schema change, no ATTACH. Layer 2 protection is continuous
+    the main database file immutable for the life of the connection — no
+    journal creation, no schema change. Layer 2 protection is continuous
     rather than per-query.
+
+    `ATTACH DATABASE` is NOT blocked by VFS read-only (SQLite will attach
+    another file, also read-only). Our defense against ATTACH is the
+    sqlglot validator at Layer 1, which rejects it at parse time. If the
+    validator were ever relaxed, an attacker could read files outside the
+    operator's configured path set — so the validator-level rejection is
+    load-bearing.
 
     For common lookups there are dedicated tools that are faster and clearer
     than writing raw SQL — prefer them:

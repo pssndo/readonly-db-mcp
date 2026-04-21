@@ -1,8 +1,12 @@
 """Unit tests for database backend utilities — identifier validation, LIMIT injection, DSN construction, guards.
 
-These tests don't require a running database. They test the shared utilities
-and constructor logic that can be verified without network access.
+These tests don't require a running database (except the SQLite round-trip
+suite which uses a temp file). They test the shared utilities and constructor
+logic that can be verified without network access.
 """
+
+import asyncio
+import time
 
 import pytest
 
@@ -555,3 +559,170 @@ class TestSqliteBackendRoundTrip:
                 conn.execute("SELECT load_extension('/tmp/nonexistent.so')")
         finally:
             await backend.disconnect()
+
+    async def test_enable_load_extension_not_supported_is_swallowed(self, tmp_path, monkeypatch) -> None:
+        """On Python builds without SQLITE_ENABLE_LOAD_EXTENSION (e.g. some
+        Debian/Ubuntu system Python installs), `enable_load_extension` raises
+        NotSupportedError. That's fine — extension loading is already absent
+        from the build. The backend must start successfully on those builds.
+
+        We can't patch `sqlite3.Connection.enable_load_extension` directly —
+        it's a C-type method and the attribute is read-only. Instead we wrap
+        the connection in a pass-through proxy whose own
+        `enable_load_extension` raises, and patch `sqlite3.connect` at module
+        scope to return the proxy. The backend calls `sqlite3.connect` by
+        module attribute, so the monkeypatch takes effect at call time.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "restricted.db"
+        sqlite3.connect(str(db_path)).close()  # create empty DB
+        real_connect = sqlite3.connect
+
+        class _RestrictedConn:
+            """Proxy that raises NotSupportedError from enable_load_extension
+            but delegates everything else to a real sqlite3.Connection."""
+            def __init__(self, *args, **kwargs):
+                self._real = real_connect(*args, **kwargs)
+
+            def enable_load_extension(self, enabled: bool) -> None:
+                raise sqlite3.NotSupportedError(
+                    "SQLite was compiled without SQLITE_ENABLE_LOAD_EXTENSION"
+                )
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monkeypatch.setattr(sqlite3, "connect", _RestrictedConn)
+
+        backend = SqliteBackend(SqliteConnection(name="r", path=str(db_path)))
+        await backend.connect()  # must not raise
+        try:
+            # And it must remain usable — list_tables uses the wrapped conn.
+            tables = await backend.list_tables()
+            assert isinstance(tables, list)
+        finally:
+            await backend.disconnect()
+
+    async def test_execution_timeout_aborts_long_query(self, tmp_path) -> None:
+        """The progress handler enforces _timeout as a real execution timeout
+        (not just a lock-wait). A deliberately slow self-join should be
+        aborted and surface as sqlite3.OperationalError('interrupted').
+
+        We use a self-join on a sizeable table instead of a recursive CTE
+        because sqlglot's SQLite dialect has trouble round-tripping the
+        `WITH RECURSIVE c(x) AS (...)` syntax (column names in a CTE alias).
+        The self-join approach also exercises more VDBE opcodes per unit of
+        work, which matches real slow-query shapes.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "t.db"
+        # Populate with enough rows that a 3-way self-join runs >1s. On a
+        # modern CPU, 500 rows × 500 × 500 = 125M row pairs examined.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            "CREATE TABLE big (i INTEGER);"
+            "WITH RECURSIVE s AS (SELECT 1 AS x UNION ALL SELECT x+1 FROM s WHERE x < 500) "
+            "INSERT INTO big SELECT x FROM s;"
+        )
+        conn.commit()
+        conn.close()
+
+        # Configure a 1-second execution timeout
+        cfg = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=1, max_result_rows=1000,
+        )
+        backend = SqliteBackend(SqliteConnection(name="t", path=str(db_path)), cfg)
+        await backend.connect()
+        try:
+            # Cartesian 3-way self-join. The progress handler fires every
+            # 1000 VDBE ops and aborts once the 1s deadline passes.
+            slow_query = "SELECT count(*) FROM big a, big b, big c WHERE a.i < b.i AND b.i < c.i"
+            start = time.monotonic()
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                await backend.execute(slow_query)
+            elapsed = time.monotonic() - start
+            # Should abort within a few seconds of the 1s deadline. Generous
+            # upper bound to avoid flakiness on slow CI.
+            assert elapsed < 10, f"execution timeout took {elapsed}s, should be ~1s"
+        finally:
+            await backend.disconnect()
+
+    async def test_concurrent_queries_serialize_safely(self, tmp_path) -> None:
+        """Two concurrent execute() calls against the same backend share one
+        sqlite3.Connection. Without serialization they would race on cursor
+        state / SQLITE_MISUSE. With the asyncio.Lock, both complete correctly."""
+        backend = await self._fresh_db(tmp_path)
+        try:
+            # Launch two queries concurrently. Both should return their own
+            # independent result sets.
+            results = await asyncio.gather(
+                backend.execute("SELECT id, name FROM users ORDER BY id"),
+                backend.execute("SELECT id, name FROM users ORDER BY id DESC"),
+            )
+            cols_asc, rows_asc, _ = results[0]
+            cols_desc, rows_desc, _ = results[1]
+            assert cols_asc == ["id", "name"]
+            assert cols_desc == ["id", "name"]
+            assert rows_asc == [(1, "Alice"), (2, "Bob")]
+            assert rows_desc == [(2, "Bob"), (1, "Alice")]
+        finally:
+            await backend.disconnect()
+
+    async def test_disconnect_waits_for_inflight_query(self, tmp_path) -> None:
+        """disconnect() must acquire the same lock as queries so it can't
+        close the connection while a query is still using it on a worker
+        thread. We verify by launching a slow query, sleeping briefly to let
+        it start, then calling disconnect — the disconnect should wait for
+        the query to finish and then close cleanly."""
+        # Use a timeout long enough that the query would complete normally.
+        cfg = Config(
+            postgres_connections=[], clickhouse_connections=[],
+            query_timeout_seconds=30, max_result_rows=1000,
+        )
+
+        import sqlite3
+        db_path = tmp_path / "t.db"
+        # Populate with enough rows that the query takes perceptible time.
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            "CREATE TABLE t (i INTEGER);"
+            "WITH RECURSIVE s AS (SELECT 1 AS x UNION ALL SELECT x+1 FROM s WHERE x < 300) "
+            "INSERT INTO t SELECT x FROM s;"
+        )
+        conn.commit()
+        conn.close()
+
+        backend = SqliteBackend(SqliteConnection(name="t", path=str(db_path)), cfg)
+        await backend.connect()
+
+        # Launch a self-join query that will take a measurable moment.
+        query_task = asyncio.create_task(
+            backend.execute("SELECT count(*) FROM t a, t b WHERE a.i <= b.i")
+        )
+        # Let the query actually start (grab the lock).
+        await asyncio.sleep(0.1)
+
+        # Now call disconnect. It must wait for the query to finish rather
+        # than closing the connection while execute() is mid-flight.
+        await backend.disconnect()
+
+        # The query should have completed cleanly before disconnect returned.
+        cols, rows, _ = await query_task
+        # sqlglot's round-trip may upcase the function name in the column
+        # label (count(*) → COUNT(*)); compare case-insensitively.
+        assert len(cols) == 1 and cols[0].lower() == "count(*)"
+        assert rows[0][0] > 0
+
+    async def test_query_after_disconnect_raises_cleanly(self, tmp_path) -> None:
+        """If a query is queued behind disconnect (gets the lock after it),
+        it should see a clean RuntimeError('Not connected') rather than
+        crashing inside sqlite3 on a closed connection."""
+        backend = await self._fresh_db(tmp_path)
+        await backend.disconnect()
+
+        # Now try to run a query against the disconnected backend.
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await backend.execute("SELECT 1")
